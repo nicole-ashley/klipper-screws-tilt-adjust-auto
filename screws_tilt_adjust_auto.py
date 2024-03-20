@@ -73,7 +73,7 @@ class ScrewsTiltAdjustAuto:
         for i in range(self.maximum_attempts):
             self._measure_bed_tilt()
             movements = self._calculate_motor_movements()
-            if all(m != 0 for m in movements):
+            if any(m != 0 for m in movements):
                 self.gcode.respond_info("STAA: Motor movements: " + ", ".join(map(str, movements)))
                 self._turn_motors(movements)
             else:
