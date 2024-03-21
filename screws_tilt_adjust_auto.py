@@ -69,6 +69,7 @@ class ScrewsTiltAdjustAuto:
 
         self._home_if_necessary()
         self._connect_to_board()
+        adjustments_made = False
 
         for i in range(self.maximum_attempts):
             self._measure_bed_tilt()
@@ -76,9 +77,12 @@ class ScrewsTiltAdjustAuto:
             if any(m != 0 for m in movements):
                 self.gcode.respond_info("STAA: Motor movements: " + ", ".join(map(str, movements)))
                 self._turn_motors(movements)
+                adjustments_made = True
             else:
                 self._disconnect_from_board()
-                self.gcode.run_script_from_command("G28 Z")
+                if adjustments_made:
+                    self.gcode.respond_info("STAA: Homing Z as bed level will have changed")
+                    self.gcode.run_script_from_command("G28 Z")
                 self.gcode.respond_info("STAA: Done")
                 return
 
@@ -99,7 +103,7 @@ class ScrewsTiltAdjustAuto:
         self.active = True
         self.measurements = []
         self.gcode.respond_info("STAA: Measuring bed tilt")
-        self.gcode.run_script_from_command("SCREWS_TILT_CALCULATE")
+        self.gcode.run_script_from_command("SCREWS_TILT_CALCULATE MAX_DEVIATION=10")
         self.active = False
 
     def _calculate_motor_movements(self):
