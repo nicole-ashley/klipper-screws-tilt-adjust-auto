@@ -59,7 +59,6 @@ class ScrewsTiltAdjustAuto:
         directions[screw - 1] = distance
 
         self._connect_to_board()
-        time.sleep(5)
         self.gcode.respond_info("STAA: " + ",".join(map(str, directions)))
         self._turn_motors(directions)
         self._disconnect_from_board()
@@ -134,6 +133,7 @@ class ScrewsTiltAdjustAuto:
 
             wait_time = abs(distance) * self.full_turn_time_in_seconds
             self.gcode.respond_info("STAA: " + str(motor) + " for " + str(wait_time) + " seconds.")
+            self.board.reset_input_buffer()
             self.board.write(str(motor).encode())
             self.board.read(1)
             time.sleep(wait_time)
