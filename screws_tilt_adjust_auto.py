@@ -39,7 +39,8 @@ class ScrewsTiltAdjustAuto:
     def _connect_to_board(self):
         self.board = serial.Serial(
             port=self.serial_device,
-            baudrate=self.serial_baud
+            baudrate=self.serial_baud,
+            timeout=5
         )
 
     def _disconnect_from_board(self):
@@ -134,6 +135,7 @@ class ScrewsTiltAdjustAuto:
             wait_time = abs(distance) * self.full_turn_time_in_seconds
             self.gcode.respond_info("STAA: " + str(motor) + " for " + str(wait_time) + " seconds.")
             self.board.write(str(motor).encode())
+            self.board.read(1)
             time.sleep(wait_time)
 
         self.gcode.respond_info("STAA: Stopping motors.")
