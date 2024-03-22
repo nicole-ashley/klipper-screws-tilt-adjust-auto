@@ -14,7 +14,7 @@ ln -s ~/klipper/klippy/extras/screws-tilt-adjust-auto.py ~/screws-tilt-adjust-au
 ```
 And for automatic updates, add this section to your `moonraker.conf`:
 ```yml
-[update_manager screws_tilt_adjust_auto]
+[update_manager screws-tilt-adjust-auto]
 type: git_repo
 path: ~/screws-tilt-adjust-auto
 origin: https://github.com/nicole-ashley/klipper-screws-tilt-adjust-auto
