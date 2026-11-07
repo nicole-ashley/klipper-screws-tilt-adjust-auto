@@ -195,18 +195,20 @@ class FakePrinter:
         return self.objects.get(name, default)
 
 
-def make(heights, efficiency=1., attempts=10, with_sta=True):
+def make(heights, efficiency=1., attempts=10, with_sta=True, config=None):
     bed = Bed(heights, efficiency)
     reactor = FakeReactor()
     sta = FakeScrewsTiltAdjust(len(heights)) if with_sta else None
     gcode = FakeGcode(bed, sta or FakeScrewsTiltAdjust(len(heights)))
     printer = FakePrinter(reactor, gcode, sta)
-    obj = staa.ScrewsTiltAdjustAuto(FakeConfig(printer, {
+    values = {
         "serial_device": "/dev/null",
         "serial_baud": 9600,
         "full_turn_time_in_seconds": FULL_TURN_TIME,
         "maximum_attempts": attempts,
-    }))
+    }
+    values.update(config or {})
+    obj = staa.ScrewsTiltAdjustAuto(FakeConfig(printer, values))
     def connect():
         obj.board = obj.last_board = FakeBoard(bed, reactor)
     obj._connect_to_board = connect
@@ -264,7 +266,7 @@ class OneByOneTest(unittest.TestCase):
         self.assertNotIn("G28 Z", gcode.scripts)
 
     def test_screw_that_never_settles_fails_and_stops_motors(self):
-        obj, bed, gcode, sta = make([0., 0.2, -0.1], efficiency=0., attempts=3)
+        obj, bed, gcode, sta = make([0., 0.2, -0.1], efficiency=0.3, attempts=2)
         with self.assertRaises(CommandError) as ctx:
             obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"ONE_BY_ONE": 1}))
         self.assertIn("Unable to reach level", str(ctx.exception))

@@ -8,6 +8,21 @@ import serial
 
 HANDSHAKE_TIMEOUT = 30.
 HEATER_REPORT_INTERVAL = 10.
+# The board stops a motor that hasn't been told to keep running for this
+# long, so resend the command more often than that while a motor turns
+MOTOR_KEEPALIVE_INTERVAL = 2.
+
+# How far each of Klipper's screw_thread options moves per turn, in mm, and
+# whether a clockwise turn raises the bed (matches screws_tilt_adjust.py)
+SCREW_THREADS = {0: (0.5, True), 1: (0.5, False), 2: (0.7, True), 3: (0.7, False),
+                 4: (0.8, True), 5: (0.8, False), 6: (1.0, True), 7: (1.0, False)}
+# Klipper only supports M3 to M6, so a learned rate outside this range
+# (with some margin for rounding) means the readings can't be trusted
+MIN_TURNS_PER_MM = 1 / 1.25
+MAX_TURNS_PER_MM = 1 / 0.4
+# Below this spread of heights the turns can't be learned reliably enough to
+# be compared to screw_thread
+MIN_SPREAD_TO_CHECK_THREAD = 0.05
 
 class ScrewsTiltAdjustAuto:
     def __init__(self, config):
@@ -17,6 +32,11 @@ class ScrewsTiltAdjustAuto:
         self.maximum_attempts = config.getint("maximum_attempts", 10)
         self.scan_height = config.getfloat("scan_height", 2.)
         self.scan_sample_time = config.getfloat("scan_sample_time", 0.5)
+        self.max_turns_per_move = config.getfloat("max_turns_per_move", 1., above=0.)
+        self.max_turns_per_run = config.getfloat("max_turns_per_run", 3., above=0.)
+        self.max_deviation = config.getfloat("max_deviation", 2., above=0.)
+        self.reading_tolerance = config.getfloat("reading_tolerance", 0.02, minval=0.)
+        self.run_turns = None
         self.board = None
         self.one_by_one = False
         self.continuous = False
@@ -81,8 +101,12 @@ class ScrewsTiltAdjustAuto:
             raise gcmd.error(
                 "Error on '%s': SCREW must be 1 or more" % (gcmd.get_commandline(),))
 
+        force = bool(gcmd.get_int("FORCE", 0, minval=0, maxval=1))
+
         directions = [0] * screw
         directions[screw - 1] = distance
+        if not force:
+            self._check_move_size(directions, "Add FORCE=1 to turn it anyway.")
 
         self._connect_to_board()
         try:
@@ -101,6 +125,14 @@ class ScrewsTiltAdjustAuto:
         if self.continuous:
             # Fail before homing or measuring if the probe can't do this
             self._lookup_scanning_probe()
+        # Turns made by each screw in this run, however many passes it takes
+        self.run_turns = {}
+        try:
+            self._adjust(gcmd)
+        finally:
+            self.run_turns = None
+
+    def _adjust(self, gcmd):
         if gcmd.get_int("WAIT_FOR_HEATERS", 0, minval=0, maxval=1):
             self._adjust_while_heating(gcmd)
         else:
@@ -128,6 +160,7 @@ class ScrewsTiltAdjustAuto:
         self._connect_to_board()
         adjustments_made = False
         level = False
+        spread = None
 
         try:
             for i in range(self.maximum_attempts):
@@ -135,6 +168,7 @@ class ScrewsTiltAdjustAuto:
                     self.heaters_at_target_before_last_measurement = \
                         self._heaters_at_target(heaters)
                 self._measure_bed_tilt()
+                spread = self._check_bed_got_closer(spread)
                 movements = self._calculate_motor_movements()
                 if all(m == 0 for m in movements):
                     level = True
@@ -162,16 +196,26 @@ class ScrewsTiltAdjustAuto:
         # full measurement again afterwards, since moving one screw can
         # slightly change the others. Returns False if a screw couldn't be
         # settled within maximum_attempts.
-        target = self.heights[movements.index(0)]
+        # Refuse before turning any screw, not part way through
+        self._check_move_size(
+            movements, "Check the bed and probe, or raise max_turns_per_move.")
+        heights = self.heights
+        target = heights[movements.index(0)]
         self._learn_turns_per_mm()
         for screw, movement in enumerate(movements):
             if movement == 0:
                 continue
             with self._screw_reader(screw) as read:
+                height = heights[screw]
+                stalled = 0
                 for attempt in range(self.maximum_attempts):
                     self.gcode.respond_info("STAA: Screw %d movement: %s" % (screw + 1, movement))
                     self._turn_motors(self._single_motor(screw, movement, len(movements)))
-                    movement = self._height_to_turns(target - read())
+                    new_height = read()
+                    stalled = self._check_screw_progress(
+                        screw, movement, target, height, new_height, stalled)
+                    height = new_height
+                    movement = self._height_to_turns(target - height)
                     if movement == 0:
                         break
                 else:
@@ -359,7 +403,8 @@ class ScrewsTiltAdjustAuto:
         # Returns (height, turns, is_base) for each screw measured, in
         # Klipper's screw order. Turns are positive for clockwise.
         sta = self._lookup_screws_tilt_adjust()
-        self.gcode.run_script_from_command("SCREWS_TILT_CALCULATE MAX_DEVIATION=10")
+        self.gcode.run_script_from_command(
+            "SCREWS_TILT_CALCULATE MAX_DEVIATION=%s" % (self.max_deviation,))
         # Klipper keeps the results of the last run on screws_tilt_adjust,
         # so read them from there rather than from the console
         results = sta.get_status(self.reactor.monotonic()).get("results")
@@ -416,7 +461,69 @@ class ScrewsTiltAdjustAuto:
         total = sum(diff * diff for diff, turns in pairs)
         if total == 0:
             raise self.gcode.error("STAA: Couldn't work out turns per mm from the measurement")
-        self.turns_per_mm = sum(diff * turns for diff, turns in pairs) / total
+        learned = sum(diff * turns for diff, turns in pairs) / total
+        if not MIN_TURNS_PER_MM <= abs(learned) <= MAX_TURNS_PER_MM:
+            raise self.gcode.error(
+                "STAA: The measurement works out to %.2f turns per mm, which no supported"
+                " screw thread gives. Check the probe and retry." % (learned,))
+        expected = self._screw_thread_turns_per_mm()
+        if expected is None:
+            self.turns_per_mm = learned
+            return
+        spread = max(abs(diff) for diff, turns in pairs)
+        if spread >= MIN_SPREAD_TO_CHECK_THREAD and (
+                learned * expected < 0 or not 0.5 <= learned / expected <= 2.):
+            raise self.gcode.error(
+                "STAA: The measurement works out to %.2f turns per mm, but screw_thread"
+                " says %.2f. Check screw_thread in [screws_tilt_adjust] and the probe." % (
+                    learned, expected))
+        # Exact, unlike the learned rate, which suffers from Klipper's rounding
+        self.turns_per_mm = expected
+
+    def _screw_thread_turns_per_mm(self):
+        # From the screw_thread set in [screws_tilt_adjust], if this Klipper
+        # version exposes it
+        sta = self.printer.lookup_object('screws_tilt_adjust', None)
+        thread = SCREW_THREADS.get(getattr(sta, "thread", None))
+        if thread is None:
+            return None
+        pitch, clockwise_raises = thread
+        return 1. / pitch if clockwise_raises else -1. / pitch
+
+    def _check_bed_got_closer(self, previous_spread):
+        # After screws have been turned, the gap between the highest and
+        # lowest screw should never grow. If it does, a motor is turning the
+        # wrong way or the readings are bad, and carrying on would make it
+        # worse. Returns the spread for the next check.
+        spread = max(self.heights) - min(self.heights)
+        if previous_spread is not None and spread > previous_spread + self.reading_tolerance:
+            raise self.gcode.error(
+                "STAA: The bed got further from level after turning the screws"
+                " (%.3fmm to %.3fmm between highest and lowest). Check each motor"
+                " turns its screw the right way, then retry." % (previous_spread, spread))
+        return spread
+
+    def _check_screw_progress(self, screw, movement, target, before, after, stalled):
+        # After a turn the screw should be closer to level, and should have
+        # moved roughly as far as asked. Returns how many turns in a row the
+        # screw has barely moved.
+        if abs(target - after) > abs(target - before) + self.reading_tolerance:
+            raise self.gcode.error(
+                "STAA: Screw %d got further from level after turning (%.3fmm to %.3fmm)."
+                " Check its motor turns the right way and full_turn_time_in_seconds,"
+                " then retry." % (screw + 1, abs(target - before), abs(target - after)))
+        expected = abs(movement / self.turns_per_mm)
+        if expected < 2 * self.reading_tolerance:
+            # Too small a move to tell from the readings' noise
+            return stalled
+        if abs(after - before) >= 0.2 * expected:
+            return 0
+        stalled += 1
+        if stalled >= 2:
+            raise self.gcode.error(
+                "STAA: Screw %d barely moved after %d turns in a row. Check its motor"
+                " and coupling, then retry." % (screw + 1, stalled))
+        return stalled
 
     def _height_to_turns(self, diff):
         # How far to turn a screw to raise its corner of the bed by diff mm.
@@ -448,16 +555,45 @@ class ScrewsTiltAdjustAuto:
             base_offset = max(others)
         return [m - base_offset for m in self.adjustments]
 
+    def _check_move_size(self, movements, hint):
+        for screw, distance in enumerate(movements):
+            if abs(distance) > self.max_turns_per_move:
+                raise self.gcode.error(
+                    "STAA: Screw %d would turn %.2f turns, more than max_turns_per_move"
+                    " (%s). %s" % (screw + 1, abs(distance), self.max_turns_per_move, hint))
+
+    def _check_run_total(self, movements):
+        for screw, distance in enumerate(movements):
+            total = self.run_turns.get(screw, 0.) + abs(distance)
+            if total > self.max_turns_per_run:
+                raise self.gcode.error(
+                    "STAA: Screw %d would turn %.2f turns in total this run, more than"
+                    " max_turns_per_run (%s). Check the bed and probe, then retry." % (
+                        screw + 1, total, self.max_turns_per_run))
+
     def _turn_motors(self, movements):
+        if self.run_turns is not None:
+            # Check every screw before moving any of them
+            self._check_move_size(
+                movements, "Check the bed and probe, or raise max_turns_per_move.")
+            self._check_run_total(movements)
         for motor, distance in enumerate(movements, start=1):
             if distance == 0:
                 continue
-            elif distance < 0:
+            if self.run_turns is not None:
+                self.run_turns[motor - 1] = self.run_turns.get(motor - 1, 0.) + abs(distance)
+            if distance < 0:
                 motor *= -1
 
             wait_time = abs(distance) * self.full_turn_time_in_seconds
             self.gcode.respond_info("STAA: " + str(motor) + " for " + str(wait_time) + " seconds.")
-            self.board.write(str(motor).encode())
+            command = str(motor).encode()
+            self.board.write(command)
+            while wait_time > MOTOR_KEEPALIVE_INTERVAL:
+                self._pause(MOTOR_KEEPALIVE_INTERVAL)
+                wait_time -= MOTOR_KEEPALIVE_INTERVAL
+                # Tells the board to keep this motor running
+                self.board.write(command)
             self._pause(wait_time)
 
         self.gcode.respond_info("STAA: Stopping motors.")
