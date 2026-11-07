@@ -62,6 +62,250 @@ TEST_MAX_FRACTION = 3.
 VARIABLE_PREFIX = "staa_motor"
 
 
+# What Mainsail, Fluidd and KlipperScreen send when someone closes a dialog
+DIALOG_CLOSE = re.compile(r"^\s*RESPOND\b.*\baction:prompt_end\b", re.IGNORECASE)
+CLOSE_DIALOG_COMMAND = "_SCREWS_TILT_ADJUST_AUTO_CLOSE_DIALOG"
+CANCEL_BUTTON = "prompt_footer_button Cancel|SCREWS_TILT_ADJUST_AUTO_CANCEL|error"
+# Shown before each step on the status line, and when a run finishes
+STATUS_LABELS = {"level": "Levelling", "calibrate": "Calibrating",
+                 "test": "Motor test", "manual": "Turning screw"}
+DONE_MESSAGES = {"level": "Bed screws level", "calibrate": "Calibration done",
+                 "test": "Motor test passed", "manual": "Screw turned"}
+
+
+class Progress:
+    """Where a run is up to. Read by Mainsail, Fluidd, KlipperScreen and
+    macros through printer.screws_tilt_adjust_auto, and shown on the status
+    line and, when asked for, in a dialog that's redrawn at each step.
+
+    Klipper runs one G-code command at a time, so macros like M117 or
+    RESPOND can't run while a levelling run holds the lock. Everything here
+    is sent from the extra itself instead."""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.printer = owner.printer
+        self.title = ""
+        self.intro = ""
+        self.dialog = False
+        self.dialog_closed = False
+        self.previous_message = None
+        self._reset("idle", "")
+
+    def _reset(self, state, mode):
+        self.state = state
+        self.running = False
+        self.mode = mode
+        self.heaters = ""
+        self.heater_temps = ""
+        self.pass_number = 0
+        self.max_passes = 0
+        self.screw = None
+        self.message = ""
+        self.screws = []
+        self.spread = None
+        self.start_spread = None
+        self.run_turns = []
+        self.error = ""
+
+    def get_status(self):
+        return {
+            "state": self.state,
+            "running": self.running,
+            "mode": self.mode,
+            "heaters": self.heaters,
+            "pass": self.pass_number,
+            "max_passes": self.max_passes,
+            "screw": self._name(self.screw) if self.screw is not None else "",
+            "message": self.message,
+            "screws": [dict(s) for s in self.screws],
+            "spread": self.spread,
+            "start_spread": self.start_spread,
+            "run_turns": list(self.run_turns),
+            "error": self.error,
+        }
+
+    # Run start and end
+
+    def start(self, mode, title, intro, dialog):
+        self._reset("starting", mode)
+        self.running = True
+        self.title = title
+        self.intro = intro
+        self.dialog = dialog
+        self.dialog_closed = False
+        display = self._display_status()
+        self.previous_message = getattr(display, "message", None)
+        self.step("starting", "Starting")
+
+    def finish(self, state, error="", home_z=False):
+        self.running = False
+        self.state = state
+        self.screw = None
+        self.error = error
+        display = self._display_status()
+        if display is not None:
+            display.message = self.previous_message
+        if state == "done":
+            self.message = DONE_MESSAGES.get(self.mode, "Done")
+        elif state == "cancelled":
+            self.message = "Cancelled"
+        else:
+            self.message = "Stopped: " + error
+        if not self.dialog or self.dialog_closed:
+            return
+        if state == "cancelled" and not home_z:
+            # Whoever pressed Cancel already knows
+            self._prompt("prompt_end")
+            return
+        lines = [self.message]
+        if home_z:
+            lines.append("Screws were turned, so home Z (G28 Z) before printing.")
+        lines += self._summary_lines()
+        self._show(lines, "prompt_footer_button Close|%s" % (CLOSE_DIALOG_COMMAND,))
+
+    def close_dialog(self):
+        # Someone closed the dialog. It stays closed for the rest of the run,
+        # and the status line carries on.
+        if self.dialog and not self.dialog_closed:
+            self.dialog_closed = True
+            self._prompt("prompt_end")
+
+    # Updates during a run
+
+    def step(self, state, message, screw=None):
+        if not self.running:
+            return
+        self.state = state
+        self.message = message
+        self.screw = screw
+        display = self._display_status()
+        if display is not None:
+            display.message = "%s: %s" % (STATUS_LABELS.get(self.mode, "Bed screws"), message)
+        self._redraw()
+
+    def set_heaters(self, heaters):
+        # "" when no heaters are on, "warming_up" or "at_temperature"
+        self.heaters = heaters
+
+    def set_heater_temps(self, temps):
+        self.heater_temps = temps
+
+    def set_pass(self, number, maximum):
+        self.pass_number = number
+        self.max_passes = maximum
+
+    def set_turns(self, run_turns, count):
+        self.run_turns = [round(run_turns.get(i, 0.), 4) for i in range(count)]
+
+    def measured(self, heights, movements):
+        # After measuring every screw. Heights are only compared when there's
+        # one for every screw.
+        if len(heights) != len(movements):
+            self.screws = [self._screw(i, None, m, False) for i, m in enumerate(movements)]
+            return
+        reference = movements.index(0)
+        self.screws = [self._screw(i, heights[i] - heights[reference], m, i == reference)
+                       for i, m in enumerate(movements)]
+        self.spread = round(max(heights) - min(heights), 4)
+        if self.start_spread is None:
+            self.start_spread = self.spread
+
+    def screw_moved(self, screw, deviation, turns):
+        # After measuring one screw on its own
+        if screw < len(self.screws):
+            self.screws[screw] = self._screw(
+                screw, deviation, turns, self.screws[screw]["reference"])
+
+    # Helpers
+
+    def _screw(self, index, deviation, turns, reference):
+        return {
+            "name": self._name(index),
+            "deviation": None if deviation is None else round(deviation, 4),
+            "turns": round(turns, 4),
+            "level": turns == 0,
+            "reference": reference,
+        }
+
+    def _name(self, screw):
+        return str(self.owner._screw_name(screw))
+
+    def _display_status(self):
+        # What M117 sets, shown by Mainsail, Fluidd, KlipperScreen and LCDs
+        display = self.printer.lookup_object('display_status', None)
+        if display is None or not hasattr(display, "message"):
+            return None
+        return display
+
+    def _screw_line(self, screw):
+        if screw["reference"]:
+            text = "reference"
+        elif screw["level"]:
+            text = "level"
+        else:
+            text = self.owner._format_turns(screw["turns"])
+        if screw["deviation"] is not None and not screw["reference"] and not screw["level"]:
+            text = "%+.3fmm, %s" % (screw["deviation"], text)
+        return "%s: %s" % (screw["name"], text)
+
+    def _spread_line(self):
+        if self.spread is None:
+            return None
+        if self.start_spread is not None and self.start_spread != self.spread:
+            return "Spread %.3fmm, started at %.3fmm" % (self.spread, self.start_spread)
+        return "Spread %.3fmm" % (self.spread,)
+
+    def _summary_lines(self):
+        lines = []
+        if self.pass_number:
+            lines.append("Passes: %d" % (self.pass_number,))
+        lines += [self._screw_line(s) for s in self.screws]
+        spread = self._spread_line()
+        if spread:
+            lines.append(spread)
+        if any(self.run_turns):
+            lines.append("Turned: " + ", ".join(
+                "%s %.2f" % (self._name(i), t) for i, t in enumerate(self.run_turns) if t))
+        return lines
+
+    def _redraw(self):
+        if not self.dialog or self.dialog_closed:
+            return
+        lines = []
+        if self.state == "waiting_for_heaters":
+            lines.append("Waiting for heaters" + (": " + self.heater_temps if self.heater_temps else ""))
+        elif self.pass_number:
+            heading = "Pass %d of up to %d" % (self.pass_number, self.max_passes)
+            if self.heaters == "warming_up":
+                heading += ", heaters warming up"
+            elif self.heaters == "at_temperature":
+                heading += ", at temperature"
+            lines.append(heading)
+        if self.state == "starting":
+            lines.append(self.intro + " Cancel stops the motors straight away. A"
+                         " probe move that's already started finishes first.")
+        elif self.state != "waiting_for_heaters":
+            lines.append(self.message)
+        lines += [self._screw_line(s) for s in self.screws]
+        spread = self._spread_line()
+        if spread:
+            lines.append(spread)
+        self._show(lines, CANCEL_BUTTON)
+
+    def _show(self, lines, button):
+        self._prompt("prompt_begin " + self.title)
+        for line in lines:
+            self._prompt("prompt_text " + line)
+        self._prompt(button)
+        self._prompt("prompt_show")
+
+    def _prompt(self, action):
+        # Same output as RESPOND TYPE=command, which Mainsail, Fluidd and
+        # KlipperScreen show as a dialog
+        self.owner._prompt(action)
+
+
 class MotorModel:
     """How long to run one motor for a given turn. Turning direction
     changes how fast the motor runs, since one way works against the bed
@@ -135,6 +379,7 @@ class ScrewsTiltAdjustAuto:
         self.motors_moved = False
 
         self.printer = config.get_printer()
+        self.progress = Progress(self)
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
         self.gcode.register_command("SCREWS_TILT_ADJUST_AUTO",
@@ -152,8 +397,17 @@ class ScrewsTiltAdjustAuto:
         self.gcode.register_command("SCREWS_TILT_ADJUST_AUTO_TEST",
                                     self.cmd_SCREWS_TILT_ADJUST_AUTO_TEST,
                                     desc=self.cmd_SCREWS_TILT_ADJUST_AUTO_TEST_help)
+        self.gcode.register_command(CLOSE_DIALOG_COMMAND, self.cmd_CLOSE_DIALOG)
         self.gcode.register_output_handler(self._handle_output)
         self._catch_cancel_commands()
+
+    def get_status(self, eventtime=None):
+        # printer.screws_tilt_adjust_auto, for Mainsail, Fluidd, KlipperScreen
+        # and macros
+        return self.progress.get_status()
+
+    def cmd_CLOSE_DIALOG(self, gcmd):
+        self._prompt("prompt_end")
 
     def _catch_cancel_commands(self):
         # A run holds Klipper's G-code lock until it finishes, so a cancel
@@ -166,6 +420,11 @@ class ScrewsTiltAdjustAuto:
             return
         def run_script_or_cancel(script):
             if self.running:
+                if DIALOG_CLOSE.match(script):
+                    # Closing the dialog would otherwise wait for the run,
+                    # then close whatever dialog is open by then
+                    self.progress.close_dialog()
+                    return
                 command = self._single_command(script)
                 if command in CANCEL_COMMANDS:
                     self._request_cancel()
@@ -191,43 +450,48 @@ class ScrewsTiltAdjustAuto:
             raise self.gcode.error("STAA: Cancelled")
 
     @contextlib.contextmanager
-    def _run(self, gcmd=None, title="Levelling bed screws",
+    def _run(self, gcmd=None, mode="level", title="Levelling bed screws",
              text="Turning the bed screws until the bed is level."):
         # Marks a command that turns motors as running, so it can be
-        # cancelled, and shows the cancel dialog when asked to
+        # cancelled, and keeps its progress up to date, in a dialog with a
+        # Cancel button when asked to
         if self.running:
             raise self.gcode.error("STAA: Already running")
         dialog = gcmd is not None and bool(gcmd.get_int("DIALOG", 0, minval=0, maxval=1))
         self.running = True
         self.cancel_requested = False
         self.motors_moved = False
-        if dialog:
-            self._show_cancel_dialog(title, text)
+        self.progress.start(mode, title, text, dialog)
         try:
             yield
-        except self.gcode.error:
-            if self.cancel_requested and self.motors_moved:
+        except Exception as e:
+            cancelled = self.cancel_requested
+            home_z = cancelled and self.motors_moved
+            if home_z:
                 self._info("Screws were turned before cancelling, so home Z (G28 Z)"
                            " before printing")
+            if cancelled:
+                self.progress.finish("cancelled", home_z=home_z)
+            else:
+                self.progress.finish("failed", self._error_text(e))
             raise
+        else:
+            self.progress.finish("done")
         finally:
             self.running = False
             self.cancel_requested = False
-            if dialog:
-                self._prompt("prompt_end")
 
-    def _show_cancel_dialog(self, title, text):
-        self._prompt("prompt_begin " + title)
-        self._prompt("prompt_text " + text +
-                     " Cancel stops the motors straight away. A probe move that's"
-                     " already started finishes first.")
-        self._prompt("prompt_footer_button Cancel|SCREWS_TILT_ADJUST_AUTO_CANCEL|error")
-        self._prompt("prompt_show")
+    def _error_text(self, error):
+        # Just the message, without "Error on '...': STAA: "
+        text = re.sub(r"^Error on '.*?': ", "", str(error))
+        return re.sub(r"^STAA: ", "", text)
 
     def _prompt(self, action):
         # Same output as RESPOND TYPE=command, which Mainsail, Fluidd and
-        # KlipperScreen show as a dialog
-        self.gcode.respond_raw("// action:" + action)
+        # KlipperScreen show as a dialog. It shows even while Klipper's own
+        # output is held back.
+        respond_raw = self.held_respond_raw or self.gcode.respond_raw
+        respond_raw("// action:" + action)
 
     cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL_help = "Cancel a running bed screw adjustment"
     def cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL(self, gcmd):
@@ -384,7 +648,8 @@ class ScrewsTiltAdjustAuto:
             self._check_move_size(directions, "Add FORCE=1 to turn it anyway.")
 
         self._load_motor_state()
-        with self._run(gcmd):
+        with self._run(gcmd, "manual", "Turning a bed screw",
+                       "Turning %s." % (self._screw_name(screw - 1),)):
             self._connect_to_board()
             try:
                 self._info("Turning " + self._describe_movements(directions))
@@ -447,12 +712,14 @@ class ScrewsTiltAdjustAuto:
 
         try:
             for i in range(self.maximum_attempts):
+                self.progress.set_pass(i + 1, self.maximum_attempts)
                 if heaters is not None:
                     self.heaters_at_target_before_last_measurement = \
                         self._heaters_at_target(heaters)
                 self._measure_bed_tilt()
                 spread = self._check_bed_got_closer(spread)
                 movements = self._calculate_motor_movements()
+                self.progress.measured(self.heights, movements)
                 if all(m == 0 for m in movements):
                     level = True
                     break
@@ -468,6 +735,7 @@ class ScrewsTiltAdjustAuto:
 
         if adjustments_made:
             self._info("Homing Z as bed level will have changed")
+            self.progress.step("homing", "Homing Z")
             self.gcode.run_script_from_command("G28 Z")
         if level:
             self._info("Bed screws level")
@@ -508,6 +776,7 @@ class ScrewsTiltAdjustAuto:
                     self._learn_from_turn(screw, height, new_height)
                     height = new_height
                     movement = self._height_to_turns(target - height)
+                    self.progress.screw_moved(screw, height - target, movement)
                     if movement == 0:
                         break
                 else:
@@ -543,6 +812,8 @@ class ScrewsTiltAdjustAuto:
         sta = self._lookup_screws_tilt_adjust()
         coord = sta.screws[screw][0]
         self._debug("Watching screw %d with the probe" % (screw + 1,))
+        self.progress.step("measuring", "Watching %s with the probe" % (
+            self._screw_name(screw),), screw)
         self._move_to_scan(probe, sta, coord)
         gcmd = self.gcode.create_gcode_command("PROBE", "PROBE", {
             "METHOD": "scan", "SAMPLE_TIME": str(self.scan_sample_time)})
@@ -603,16 +874,19 @@ class ScrewsTiltAdjustAuto:
         heaters = self._lookup_heaters(gcmd)
 
         if not self._heating_heaters(heaters):
+            self.progress.set_heaters("")
             self._info("No heaters have a target temperature, adjusting once")
             self._adjust_or_fail(gcmd)
             return
 
         if self._heaters_at_target(heaters):
+            self.progress.set_heaters("at_temperature")
             self._info("Heaters already at target, adjusting once")
             self._adjust_or_fail(gcmd)
             return
 
         self._info("Adjusting while heaters reach target")
+        self.progress.set_heaters("warming_up")
         level = self._auto_adjust(heaters)
 
         if level and self.heaters_at_target_before_last_measurement:
@@ -626,6 +900,7 @@ class ScrewsTiltAdjustAuto:
             self._info("Could not reach level while heating, will adjust again at target")
 
         self._wait_for_heaters(gcmd, heaters)
+        self.progress.set_heaters("at_temperature")
         self._info("Heaters at target, adjusting for heat flex")
         self._adjust_or_fail(gcmd)
 
@@ -671,6 +946,8 @@ class ScrewsTiltAdjustAuto:
                     current, target = heater.get_temp(eventtime)
                     temps.append("%s %.1f/%.1f" % (name, current, target))
                 self._info("Waiting for " + ", ".join(temps))
+                self.progress.set_heater_temps(", ".join(temps))
+                self.progress.step("waiting_for_heaters", "Waiting for heaters")
                 next_report = eventtime + HEATER_REPORT_INTERVAL
             self._pause(1.)
 
@@ -680,10 +957,12 @@ class ScrewsTiltAdjustAuto:
         kin_status = toolhead.get_kinematics().get_status(curtime)
         if kin_status['homed_axes'] != 'xyz':
             self._debug("Homing toolhead")
+            self.progress.step("homing", "Homing")
             self.gcode.run_script_from_command("G28")
 
     def _measure_bed_tilt(self):
         self._debug("Measuring bed tilt")
+        self.progress.step("measuring", "Measuring all screws")
         self._run_screws_tilt_calculate()
 
     def _run_screws_tilt_calculate(self):
@@ -706,6 +985,7 @@ class ScrewsTiltAdjustAuto:
         probe_points = sta.probe_helper.probe_points
         results = getattr(sta, "results", None)
         self._debug("Measuring screw %d" % (screw + 1,))
+        self.progress.step("measuring", "Measuring " + self._screw_name(screw), screw)
         try:
             sta.screws = [screws[screw]]
             sta.probe_helper.probe_points = [coord for coord, name in sta.screws]
@@ -870,8 +1150,12 @@ class ScrewsTiltAdjustAuto:
             motor = self._motor(screw)
             seconds, backlash = motor.seconds_for(distance)
             direction = CW if distance > 0 else CCW
+            self.progress.step("turning", "Turning %s %s" % (
+                self._screw_name(screw), self._format_turns(distance)), screw)
             self._run_motor(screw, direction, seconds)
             self.last_turn = (screw, direction, abs(distance), seconds, backlash)
+            if self.run_turns is not None:
+                self.progress.set_turns(self.run_turns, len(movements))
 
         self._stop_motors()
 
@@ -1003,7 +1287,8 @@ class ScrewsTiltAdjustAuto:
         self._check_move_size([turns * 2], "Use a smaller TURNS.")
         self._load_motor_state()
         try:
-            with self._run(gcmd):
+            with self._run(gcmd, "calibrate", "Calibrating screw motors",
+                           "Measuring how fast each screw motor turns."):
                 if test_first:
                     # Find wiring and coupling faults with small turns, before
                     # levelling makes big ones
@@ -1064,6 +1349,7 @@ class ScrewsTiltAdjustAuto:
         # new values.
         motor = self._motor(screw)
         self._info("Calibrating %s" % (self._screw_name(screw),))
+        self.progress.step("calibrating", "Calibrating " + self._screw_name(screw), screw)
         # Seconds for the shortest move each way, from what's known so far
         base = dict((d, motor.spin_up_time[d] + turns * motor.seconds_per_turn[d])
                     for d in DIRECTION_NAMES)
@@ -1184,7 +1470,7 @@ class ScrewsTiltAdjustAuto:
             self._lookup_scanning_probe()
         self._load_motor_state()
         try:
-            with self._run(gcmd, "Testing screw motors",
+            with self._run(gcmd, "test", "Testing screw motors",
                            "Turning each screw motor a little and back."):
                 self._self_test(turns)
         finally:
