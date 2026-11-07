@@ -199,11 +199,8 @@ class Progress:
         self.run_turns = [round(run_turns.get(i, 0.), 4) for i in range(count)]
 
     def measured(self, heights, movements):
-        # After measuring every screw. Heights are only compared when there's
-        # one for every screw.
-        if len(heights) != len(movements):
-            self.screws = [self._screw(i, None, m, False) for i, m in enumerate(movements)]
-            return
+        # After measuring every screw. Klipper's results give a height for
+        # every screw, so there's always one to compare.
         reference = movements.index(0)
         self.screws = [self._screw(i, heights[i] - heights[reference], m, i == reference)
                        for i, m in enumerate(movements)]
