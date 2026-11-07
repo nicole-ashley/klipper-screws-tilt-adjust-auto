@@ -50,6 +50,13 @@ MAX_LEARNING_RATIO = 2.
 # backlash. The two moves after it, of different lengths, separate the
 # motor's speed from its spin-up time.
 CALIBRATION_PATTERN = [(CW, 2), (CW, 1), (CW, 2), (CCW, 2), (CCW, 1), (CCW, 2)]
+# In the motor test, a screw has moved if it moved more than this many times
+# the probe's noise. Uncalibrated motors can lose much of a small turn to
+# spin-up and backlash, so anything clearly more than noise counts.
+TEST_NOISE_MULTIPLE = 2
+# The test turn must be expected to move the bed at least twice that, and a
+# screw that moves more than this many times as far as expected fails
+TEST_MAX_FRACTION = 3.
 # Prefix for values kept with [save_variables]
 VARIABLE_PREFIX = "staa_motor"
 
@@ -101,6 +108,14 @@ class ScrewsTiltAdjustAuto:
         self.learn_motor_speed = config.getboolean("learn_motor_speed", True)
         self.calibration_turns = config.getfloat("calibration_turns", 0.125, above=0.)
         self.calibration_cycles = config.getint("calibration_cycles", 2, minval=1)
+        self.test_turns = config.getfloat("test_turns", 0.5, above=0.)
+        # Debug output shows every step: each motor run, each reading, and
+        # Klipper's own output for single screw measurements. DEBUG=1 on a
+        # command turns it on for that run.
+        self.debug_default = config.getboolean("debug", False)
+        self.debug = self.debug_default
+        # Klipper's own respond_raw while its output is held back
+        self.held_respond_raw = None
         self.motors = [MotorModel(config, number, self.full_turn_time_in_seconds)
                        for number in range(1, MAX_MOTORS + 1)]
         # Details of the last turn, for learning from how far it went
@@ -135,6 +150,9 @@ class ScrewsTiltAdjustAuto:
         self.gcode.register_command("SCREWS_TILT_ADJUST_AUTO_CANCEL",
                                     self.cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL,
                                     desc=self.cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL_help)
+        self.gcode.register_command("SCREWS_TILT_ADJUST_AUTO_TEST",
+                                    self.cmd_SCREWS_TILT_ADJUST_AUTO_TEST,
+                                    desc=self.cmd_SCREWS_TILT_ADJUST_AUTO_TEST_help)
         self._catch_cancel_commands()
 
     def _catch_cancel_commands(self):
@@ -166,14 +184,15 @@ class ScrewsTiltAdjustAuto:
     def _request_cancel(self):
         if not self.cancel_requested:
             self.cancel_requested = True
-            self.gcode.respond_info("STAA: Cancelling")
+            self._info("Cancelling")
 
     def _check_cancelled(self):
         if self.cancel_requested:
             raise self.gcode.error("STAA: Cancelled")
 
     @contextlib.contextmanager
-    def _run(self, gcmd=None):
+    def _run(self, gcmd=None, title="Levelling bed screws",
+             text="Turning the bed screws until the bed is level."):
         # Marks a command that turns motors as running, so it can be
         # cancelled, and shows the cancel dialog when asked to
         if self.running:
@@ -183,14 +202,13 @@ class ScrewsTiltAdjustAuto:
         self.cancel_requested = False
         self.motors_moved = False
         if dialog:
-            self._show_cancel_dialog()
+            self._show_cancel_dialog(title, text)
         try:
             yield
         except self.gcode.error:
             if self.cancel_requested and self.motors_moved:
-                self.gcode.respond_info(
-                    "STAA: Screws were turned before cancelling, so home Z (G28 Z)"
-                    " before printing")
+                self._info("Screws were turned before cancelling, so home Z (G28 Z)"
+                           " before printing")
             raise
         finally:
             self.running = False
@@ -198,9 +216,9 @@ class ScrewsTiltAdjustAuto:
             if dialog:
                 self._prompt("prompt_end")
 
-    def _show_cancel_dialog(self):
-        self._prompt("prompt_begin Levelling bed screws")
-        self._prompt("prompt_text Turning the bed screws until the bed is level."
+    def _show_cancel_dialog(self, title, text):
+        self._prompt("prompt_begin " + title)
+        self._prompt("prompt_text " + text +
                      " Cancel stops the motors straight away. A probe move that's"
                      " already started finishes first.")
         self._prompt("prompt_footer_button Cancel|SCREWS_TILT_ADJUST_AUTO_CANCEL|error")
@@ -218,7 +236,79 @@ class ScrewsTiltAdjustAuto:
         if self.running:
             self._request_cancel()
         else:
-            self.gcode.respond_info("STAA: Nothing to cancel")
+            self._info("Nothing to cancel")
+
+    def _info(self, msg):
+        held = self.held_respond_raw
+        if held is None:
+            self.gcode.respond_info("STAA: " + msg)
+            return
+        # Our own messages always show, even while Klipper's are held back,
+        # such as a cancel arriving mid measurement
+        holding = self.gcode.respond_raw
+        self.gcode.respond_raw = held
+        try:
+            self.gcode.respond_info("STAA: " + msg)
+        finally:
+            self.gcode.respond_raw = holding
+
+    def _debug(self, msg):
+        if self.debug:
+            self._info(msg)
+
+    def _read_debug(self, gcmd):
+        self.debug = bool(gcmd.get_int(
+            "DEBUG", int(self.debug_default), minval=0, maxval=1))
+
+    def _screw_name(self, screw):
+        # The name given in [screws_tilt_adjust], as SCREWS_TILT_CALCULATE
+        # shows it
+        sta = self.printer.lookup_object('screws_tilt_adjust', None)
+        screws = getattr(sta, "screws", None)
+        if screws and screw < len(screws):
+            return screws[screw][1]
+        return "screw %d" % (screw + 1,)
+
+    def _format_turns(self, turns):
+        # Same as SCREWS_TILT_CALCULATE: CW 01:20 is one full turn and 20
+        # minutes clockwise
+        minutes = int(round(abs(turns) * 60))
+        return "%s %02d:%02d" % ("CW" if turns >= 0 else "CCW", minutes // 60, minutes % 60)
+
+    def _describe_movements(self, movements):
+        return ", ".join("%s %s" % (self._screw_name(screw), self._format_turns(turns))
+                         for screw, turns in enumerate(movements) if turns != 0)
+
+    @contextlib.contextmanager
+    def _quietly(self):
+        # Hold back Klipper's own console output (probe results and
+        # SCREWS_TILT_CALCULATE's table) unless debugging. It still goes to
+        # klippy.log, and is shown after all if something goes wrong, so an
+        # error comes with the readings that led to it.
+        if self.debug or not hasattr(self.gcode, "respond_raw"):
+            yield
+            return
+        had_own = "respond_raw" in vars(self.gcode)
+        original = self.gcode.respond_raw
+        held = []
+        self.gcode.respond_raw = held.append
+        self.held_respond_raw = original
+        try:
+            yield
+        except BaseException:
+            self.held_respond_raw = None
+            self._restore_respond_raw(had_own, original)
+            for msg in held:
+                original(msg)
+            raise
+        self.held_respond_raw = None
+        self._restore_respond_raw(had_own, original)
+
+    def _restore_respond_raw(self, had_own, original):
+        if had_own:
+            self.gcode.respond_raw = original
+        else:
+            del self.gcode.respond_raw
 
     def _pause(self, seconds):
         # Let Klipper keep running (heater control in particular) while we
@@ -273,6 +363,7 @@ class ScrewsTiltAdjustAuto:
                 "Error on '%s': SCREW must be 1 or more" % (gcmd.get_commandline(),))
 
         force = bool(gcmd.get_int("FORCE", 0, minval=0, maxval=1))
+        self._read_debug(gcmd)
 
         directions = [0] * screw
         directions[screw - 1] = distance
@@ -283,7 +374,8 @@ class ScrewsTiltAdjustAuto:
         with self._run(gcmd):
             self._connect_to_board()
             try:
-                self.gcode.respond_info("STAA: " + ",".join(map(str, directions)))
+                self._info("Turning " + self._describe_movements(directions))
+                self._debug("Motor movements: " + ", ".join(map(str, directions)))
                 self._turn_motors(directions)
             finally:
                 self._disconnect_from_board()
@@ -291,6 +383,7 @@ class ScrewsTiltAdjustAuto:
 
     cmd_SCREWS_TILT_ADJUST_AUTO_help = "Tool to automatically adjust bed level screws"
     def cmd_SCREWS_TILT_ADJUST_AUTO(self, gcmd):
+        self._read_debug(gcmd)
         self.continuous = bool(gcmd.get_int("CONTINUOUS", 0, minval=0, maxval=1))
         # Continuous mode settles one screw at a time too, it just watches
         # the screw with the probe instead of probing it again each time
@@ -330,7 +423,7 @@ class ScrewsTiltAdjustAuto:
             mode = " (continuous)"
         elif self.one_by_one:
             mode = " (one by one)"
-        self.gcode.respond_info("STAA: Starting" + mode)
+        self._info("Levelling bed screws" + mode)
         self.heaters_at_target_before_last_measurement = False
 
         self._home_if_necessary()
@@ -350,7 +443,8 @@ class ScrewsTiltAdjustAuto:
                 if all(m == 0 for m in movements):
                     level = True
                     break
-                self.gcode.respond_info("STAA: Motor movements: " + ", ".join(map(str, movements)))
+                self._info("Adjusting " + self._describe_movements(movements))
+                self._debug("Motor movements: " + ", ".join(map(str, movements)))
                 adjustments_made = True
                 if not self.one_by_one:
                     self._turn_motors(movements)
@@ -360,10 +454,10 @@ class ScrewsTiltAdjustAuto:
             self._disconnect_from_board()
 
         if adjustments_made:
-            self.gcode.respond_info("STAA: Homing Z as bed level will have changed")
+            self._info("Homing Z as bed level will have changed")
             self.gcode.run_script_from_command("G28 Z")
         if level:
-            self.gcode.respond_info("STAA: Done")
+            self._info("Bed screws level")
         return level
 
     def _adjust_one_by_one(self, movements):
@@ -386,9 +480,12 @@ class ScrewsTiltAdjustAuto:
                 height = heights[screw]
                 stalled = 0
                 for attempt in range(self.maximum_attempts):
-                    self.gcode.respond_info("STAA: Screw %d movement: %s" % (screw + 1, movement))
+                    self._debug("Screw %d movement: %s" % (screw + 1, movement))
                     self._turn_motors(self._single_motor(screw, movement, len(movements)))
                     new_height = read()
+                    self._debug("%s : z=%.5f : adjust %s" % (
+                        self._screw_name(screw), new_height,
+                        self._format_turns((target - new_height) * self.turns_per_mm)))
                     stalled = self._check_screw_progress(
                         screw, movement, target, height, new_height, stalled)
                     self._learn_from_turn(screw, height, new_height)
@@ -397,10 +494,11 @@ class ScrewsTiltAdjustAuto:
                     if movement == 0:
                         break
                 else:
-                    self.gcode.respond_info("STAA: Unable to level screw %d after %s attempts" % (
-                        screw + 1, self.maximum_attempts))
+                    self._info("Unable to level %s after %s attempts" % (
+                        self._screw_name(screw), self.maximum_attempts))
                     return False
-            self.gcode.respond_info("STAA: Screw %d level" % (screw + 1,))
+            self._info("%s level after %d %s" % (
+                self._screw_name(screw), attempt + 1, "try" if attempt == 0 else "tries"))
         return True
 
     @contextlib.contextmanager
@@ -427,7 +525,7 @@ class ScrewsTiltAdjustAuto:
         probe = self._lookup_scanning_probe()
         sta = self._lookup_screws_tilt_adjust()
         coord = sta.screws[screw][0]
-        self.gcode.respond_info("STAA: Watching screw %d with the probe" % (screw + 1,))
+        self._debug("Watching screw %d with the probe" % (screw + 1,))
         self._move_to_scan(probe, sta, coord)
         gcmd = self.gcode.create_gcode_command("PROBE", "PROBE", {
             "METHOD": "scan", "SAMPLE_TIME": str(self.scan_sample_time)})
@@ -488,34 +586,30 @@ class ScrewsTiltAdjustAuto:
         heaters = self._lookup_heaters(gcmd)
 
         if not self._heating_heaters(heaters):
-            self.gcode.respond_info(
-                "STAA: No heaters have a target temperature, adjusting once")
+            self._info("No heaters have a target temperature, adjusting once")
             self._adjust_or_fail(gcmd)
             return
 
         if self._heaters_at_target(heaters):
-            self.gcode.respond_info(
-                "STAA: Heaters already at target, adjusting once")
+            self._info("Heaters already at target, adjusting once")
             self._adjust_or_fail(gcmd)
             return
 
-        self.gcode.respond_info("STAA: Adjusting while heaters reach target")
+        self._info("Adjusting while heaters reach target")
         level = self._auto_adjust(heaters)
 
         if level and self.heaters_at_target_before_last_measurement:
             # The measurement that found the bed level was taken at
             # temperature, so there's no heat flex left to adjust for
-            self.gcode.respond_info(
-                "STAA: Heaters were at target for the final measurement, finished")
+            self._info("Heaters were at target for the final measurement, finished")
             return
         if not level:
             # The bed is still moving as it heats, so this can happen. The
             # pass at temperature below is the one that has to succeed.
-            self.gcode.respond_info(
-                "STAA: Could not reach level while heating, will adjust again at target")
+            self._info("Could not reach level while heating, will adjust again at target")
 
         self._wait_for_heaters(gcmd, heaters)
-        self.gcode.respond_info("STAA: Heaters at target, adjusting for heat flex")
+        self._info("Heaters at target, adjusting for heat flex")
         self._adjust_or_fail(gcmd)
 
     def _lookup_heaters(self, gcmd):
@@ -547,7 +641,7 @@ class ScrewsTiltAdjustAuto:
                        for name, heater in self._heating_heaters(heaters))
 
     def _wait_for_heaters(self, gcmd, heaters):
-        self.gcode.respond_info("STAA: Waiting for heaters to reach target")
+        self._info("Waiting for heaters to reach target")
         next_report = self.reactor.monotonic()
         while not self._heaters_at_target(heaters):
             if self.printer.is_shutdown():
@@ -559,7 +653,7 @@ class ScrewsTiltAdjustAuto:
                 for name, heater in self._heating_heaters(heaters):
                     current, target = heater.get_temp(eventtime)
                     temps.append("%s %.1f/%.1f" % (name, current, target))
-                self.gcode.respond_info("STAA: Waiting for " + ", ".join(temps))
+                self._info("Waiting for " + ", ".join(temps))
                 next_report = eventtime + HEATER_REPORT_INTERVAL
             self._pause(1.)
 
@@ -568,11 +662,11 @@ class ScrewsTiltAdjustAuto:
         curtime = self.printer.get_reactor().monotonic()
         kin_status = toolhead.get_kinematics().get_status(curtime)
         if kin_status['homed_axes'] != 'xyz':
-            self.gcode.respond_info("STAA: Homing toolhead")
+            self._debug("Homing toolhead")
             self.gcode.run_script_from_command("G28")
 
     def _measure_bed_tilt(self):
-        self.gcode.respond_info("STAA: Measuring bed tilt")
+        self._debug("Measuring bed tilt")
         screws = self._run_screws_tilt_calculate()
         self.heights = [z for z, turns, is_base in screws]
         self.adjustments = [turns for z, turns, is_base in screws]
@@ -614,11 +708,13 @@ class ScrewsTiltAdjustAuto:
         screws = sta.screws
         probe_points = sta.probe_helper.probe_points
         results = sta.results
-        self.gcode.respond_info("STAA: Measuring screw %d" % (screw + 1,))
+        self._debug("Measuring screw %d" % (screw + 1,))
         try:
             sta.screws = [screws[screw]]
             sta.probe_helper.probe_points = [coord for coord, name in sta.screws]
-            measured = self._run_screws_tilt_calculate()
+            # A one screw table on every turn isn't much use to anyone
+            with self._quietly():
+                measured = self._run_screws_tilt_calculate()
         finally:
             sta.screws = screws
             sta.probe_helper.probe_points = probe_points
@@ -783,7 +879,7 @@ class ScrewsTiltAdjustAuto:
         # stops it, so callers stop the motors when they're done.
         self._check_cancelled()
         motor = (screw + 1) * direction
-        self.gcode.respond_info("STAA: %d for %.3f seconds." % (motor, seconds))
+        self._debug("%d for %.3f seconds." % (motor, seconds))
         command = str(motor).encode()
         self.board.write(command)
         self.motors_moved = True
@@ -798,7 +894,7 @@ class ScrewsTiltAdjustAuto:
         self._pause(wait_time)
 
     def _stop_motors(self):
-        self.gcode.respond_info("STAA: Stopping motors.")
+        self._debug("Stopping motors.")
         self.board.write("0".encode())
 
     def _learn_from_turn(self, screw, before, after):
@@ -825,6 +921,9 @@ class ScrewsTiltAdjustAuto:
         if not 1. / MAX_LEARNING_RATIO <= estimate / current <= MAX_LEARNING_RATIO:
             return
         motor.seconds_per_turn[direction] = current + LEARNING_RATE * (estimate - current)
+        self._debug("Motor %d %s: %.3fs per turn, now %.3fs" % (
+            motor.number, DIRECTION_NAMES[direction], current,
+            motor.seconds_per_turn[direction]))
 
     def _variables(self):
         # Values kept with Klipper's [save_variables], or None without it
@@ -875,14 +974,16 @@ class ScrewsTiltAdjustAuto:
                             "SAVE_VARIABLE VARIABLE=%s VALUE=%r" % (name, value))
         except self.gcode.error as e:
             # Don't hide whatever the run itself reported
-            self.gcode.respond_info("STAA: Couldn't save motor speeds: %s" % (e,))
+            self._info("Couldn't save motor speeds: %s" % (e,))
 
     cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE_help = \
         "Measure how fast each screw motor turns each way, and its backlash"
     def cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(self, gcmd):
         self.continuous = bool(gcmd.get_int("CONTINUOUS", 0, minval=0, maxval=1))
         self.one_by_one = True
+        self._read_debug(gcmd)
         level_first = bool(gcmd.get_int("LEVEL", 1, minval=0, maxval=1))
+        test_first = bool(gcmd.get_int("TEST", 1, minval=0, maxval=1))
         cycles = gcmd.get_int("CYCLES", self.calibration_cycles, minval=1)
         turns = gcmd.get_float("TURNS", self.calibration_turns, above=0.)
         screw = gcmd.get_int("SCREW", None, minval=1)
@@ -895,6 +996,10 @@ class ScrewsTiltAdjustAuto:
         self._load_motor_state()
         try:
             with self._run(gcmd):
+                if test_first:
+                    # Find wiring and coupling faults with small turns, before
+                    # levelling makes big ones
+                    self._self_test(self.test_turns)
                 if level_first:
                     # Calibrate where the screws normally sit, since the motors
                     # run slower the tighter a screw is. Motors that are far off
@@ -902,8 +1007,7 @@ class ScrewsTiltAdjustAuto:
                     # is close enough.
                     self.run_turns = {}
                     if not self._auto_adjust():
-                        self.gcode.respond_info(
-                            "STAA: Couldn't fully level first, calibrating from here")
+                        self._info("Couldn't fully level first, calibrating from here")
                     self.run_turns = None
                 results = self._calibrate(gcmd, screw, turns, cycles)
         finally:
@@ -912,7 +1016,7 @@ class ScrewsTiltAdjustAuto:
         self._store_calibration(results)
 
     def _calibrate(self, gcmd, screw, turns, cycles):
-        self.gcode.respond_info("STAA: Calibrating motors")
+        self._info("Calibrating motors")
         self._home_if_necessary()
         self._connect_to_board()
         try:
@@ -929,7 +1033,7 @@ class ScrewsTiltAdjustAuto:
                     results.append(self._calibrate_screw(index, read, turns, cycles))
         finally:
             self._disconnect_from_board()
-        self.gcode.respond_info("STAA: Homing Z as bed level will have changed")
+        self._info("Homing Z as bed level will have changed")
         self.gcode.run_script_from_command("G28 Z")
         return results
 
@@ -951,7 +1055,7 @@ class ScrewsTiltAdjustAuto:
         # every move, then put it back where it started. Returns the motor's
         # new values.
         motor = self._motor(screw)
-        self.gcode.respond_info("STAA: Calibrating screw %d" % (screw + 1,))
+        self._info("Calibrating %s" % (self._screw_name(screw),))
         # Seconds for the shortest move each way, from what's known so far
         base = dict((d, motor.spin_up_time[d] + turns * motor.seconds_per_turn[d])
                     for d in DIRECTION_NAMES)
@@ -966,6 +1070,8 @@ class ScrewsTiltAdjustAuto:
                 self._stop_motors()
                 new_height = read()
                 moved = (new_height - height) * self.turns_per_mm * direction
+                self._debug("Screw %d %s for %.3fs moved %.4f turns" % (
+                    screw + 1, DIRECTION_NAMES[direction], seconds, moved))
                 height = new_height
                 if previous == direction:
                     steady[direction].append((seconds, moved))
@@ -1056,14 +1162,157 @@ class ScrewsTiltAdjustAuto:
             motor.backlash = result["backlash"]
             configfile.set("screws_tilt_adjust_auto", "motor%d_backlash" % (motor.number,),
                            "%.4f" % (result["backlash"],))
-            self.gcode.respond_info(
-                "STAA: Motor %d: clockwise %.3fs per turn (%.3fs spin-up),"
+            self._info(
+                "Motor %d: clockwise %.3fs per turn (%.3fs spin-up),"
                 " counter-clockwise %.3fs per turn (%.3fs spin-up), backlash %.3f turns" % (
                     motor.number, result[CW][0], result[CW][1],
                     result[CCW][0], result[CCW][1], result["backlash"]))
         self._save_motor_state()
-        self.gcode.respond_info(
-            "STAA: Calibration done. Run SAVE_CONFIG to keep these values.")
+        self._info("Calibration done. Run SAVE_CONFIG to keep these values.")
+
+    cmd_SCREWS_TILT_ADJUST_AUTO_TEST_help = \
+        "Turn each screw motor a little and back to check it moves the right screw the right way"
+    def cmd_SCREWS_TILT_ADJUST_AUTO_TEST(self, gcmd):
+        self._read_debug(gcmd)
+        self.continuous = bool(gcmd.get_int("CONTINUOUS", 0, minval=0, maxval=1))
+        turns = gcmd.get_float("TURNS", self.test_turns, above=0.)
+        if self.continuous:
+            self._lookup_scanning_probe()
+        self._load_motor_state()
+        try:
+            with self._run(gcmd, "Testing screw motors",
+                           "Turning each screw motor a little and back."):
+                self._self_test(turns)
+        finally:
+            self._save_motor_state()
+
+    def _self_test(self, turns):
+        # Turn each motor clockwise by `turns` and back again, checking that
+        # its own screw moved, the right way and about the right distance.
+        # Stops at the first fault, after putting that screw back.
+        self._check_move_size([turns], "Use a smaller TURNS.")
+        tpm = self._screw_thread_turns_per_mm()
+        if tpm is None:
+            raise self.gcode.error(
+                "STAA: The motor test needs screw_thread set in [screws_tilt_adjust]")
+        self.turns_per_mm = tpm
+        expected = turns / tpm
+        if abs(expected) < 2 * TEST_NOISE_MULTIPLE * self.reading_tolerance:
+            raise self.gcode.error(
+                "STAA: A %.3f turn test only moves the bed %.3fmm, too little to tell"
+                " from the probe's noise. Use a bigger TURNS." % (turns, abs(expected)))
+        self._info("Testing motors" + (" (continuous)" if self.continuous else ""))
+        self._home_if_necessary()
+        self._connect_to_board()
+        try:
+            if self.continuous:
+                count = len(self._lookup_screws_tilt_adjust().screws)
+                self._check_motor_count(count)
+                for screw in range(count):
+                    self._test_screw_continuous(screw, count, turns, expected)
+            else:
+                self._measure_bed_tilt()
+                count = len(self.heights)
+                self._check_motor_count(count)
+                for screw in range(count):
+                    self._test_screw_full(screw, count, turns, expected)
+        finally:
+            self._disconnect_from_board()
+        self._info("Homing Z as bed level will have changed")
+        self.gcode.run_script_from_command("G28 Z")
+        self._info("All %d motors passed the test" % (count,))
+
+    def _check_motor_count(self, count):
+        if count > MAX_MOTORS:
+            raise self.gcode.error(
+                "STAA: [screws_tilt_adjust] has %d screws, but the board only drives %d"
+                " motors" % (count, MAX_MOTORS))
+
+    def _test_screw_full(self, screw, count, turns, expected):
+        # Measure the whole bed after the turn, so a motor plugged into the
+        # wrong port shows up as the wrong screw moving
+        before = list(self.heights)
+        self._debug("Testing motor %d" % (screw + 1,))
+        self._turn_motors(self._single_motor(screw, turns, count))
+        # Klipper's table after every test turn is noise unless debugging
+        with self._quietly():
+            self._measure_bed_tilt()
+        moved = [a - b for a, b in zip(self.heights, before)]
+        fault = None
+        biggest = max(range(count), key=lambda i: abs(moved[i]))
+        if self._test_moved(moved[biggest]) and biggest != screw:
+            fault = ("STAA: Motor %d moved screw %d instead of screw %d. Check which port"
+                     " each motor is plugged into." % (screw + 1, biggest + 1, screw + 1))
+        else:
+            fault = self._test_fault(screw, moved[screw], expected)
+        # Put the screw back whatever happened
+        after = list(self.heights)
+        self._turn_motors(self._single_motor(screw, -turns, count))
+        with self._quietly():
+            self._measure_bed_tilt()
+        if fault is not None:
+            raise self.gcode.error(fault)
+        self._check_returned(screw, after[screw] - self.heights[screw], expected)
+
+    def _test_screw_continuous(self, screw, count, turns, expected):
+        # Watch the screw with the probe while its motor turns. If it doesn't
+        # move, try the other motors to find which one does move it.
+        with self._scan_screw(screw) as read:
+            self._debug("Testing motor %d" % (screw + 1,))
+            before = read()
+            self._turn_motors(self._single_motor(screw, turns, count))
+            after = read()
+            fault = self._test_fault(screw, after - before, expected)
+            self._turn_motors(self._single_motor(screw, -turns, count))
+            back = read()
+            if fault is None:
+                self._check_returned(screw, after - back, expected)
+                return
+            if not self._test_moved(after - before):
+                for other in range(count):
+                    if other == screw:
+                        continue
+                    before = read()
+                    self._turn_motors(self._single_motor(other, turns, count))
+                    after = read()
+                    self._turn_motors(self._single_motor(other, -turns, count))
+                    if self._test_moved(after - before):
+                        fault = ("STAA: Screw %d is turned by motor %d, not motor %d. Check"
+                                 " which port each motor is plugged into." % (
+                                     screw + 1, other + 1, screw + 1))
+                        break
+            raise self.gcode.error(fault)
+
+    def _test_fault(self, screw, moved, expected):
+        # What's wrong with a test turn of a screw's own motor, or None
+        self._debug("Screw %d moved %.3fmm (expected %.3fmm)" % (
+            screw + 1, moved, expected))
+        if not self._test_moved(moved):
+            return ("STAA: Screw %d barely moved when motor %d turned (%.3fmm, expected"
+                    " %.3fmm). Check the motor is plugged in, and its coupling." % (
+                        screw + 1, screw + 1, abs(moved), abs(expected)))
+        if moved * expected < 0:
+            return ("STAA: Motor %d turns screw %d the wrong way. Swap the motor's two"
+                    " wires." % (screw + 1, screw + 1))
+        if abs(moved) > TEST_MAX_FRACTION * abs(expected):
+            return ("STAA: Screw %d moved %.3fmm, far more than the %.3fmm expected."
+                    " Check full_turn_time_in_seconds, or run"
+                    " SCREWS_TILT_ADJUST_AUTO_CALIBRATE TEST=0." % (
+                        screw + 1, abs(moved), abs(expected)))
+        return None
+
+    def _test_moved(self, moved):
+        return abs(moved) > TEST_NOISE_MULTIPLE * self.reading_tolerance
+
+    def _check_returned(self, screw, moved_back, expected):
+        # Turning back should undo the test turn. A motor that only works one
+        # way, or slips against the springs, won't.
+        if not self._test_moved(moved_back) or moved_back * expected < 0:
+            raise self.gcode.error(
+                "STAA: Screw %d didn't come back when motor %d turned counter-clockwise"
+                " (%.3fmm, expected %.3fmm). Check the motor and its coupling." % (
+                    screw + 1, screw + 1, moved_back, expected))
+        self._info("Motor %d OK (%s)" % (screw + 1, self._screw_name(screw)))
 
 
 class _NoConfig:
