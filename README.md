@@ -43,6 +43,8 @@ managed_services: klipper
   - **One screw at a time**: `ONE_BY_ONE=1`.
   - **Continuous (eddy probe)**: `CONTINUOUS=1`, only shown when you have a `[probe_eddy_current]` probe.
 
+  A **Test motors** button runs `SCREWS_TILT_ADJUST_AUTO_TEST` (with `CONTINUOUS=1` when you have an eddy current probe).
+
   Every option runs with `WAIT_FOR_HEATERS=1`, so if the heaters are warming up it levels now and again at temperature. With no heaters on, or all at temperature, it levels once. While it runs, a dialog with a **Cancel** button stays open. Needs the `[include]` line above.
 - `CANCEL_LEVEL_BED_SCREWS` (or `SCREWS_TILT_ADJUST_AUTO_CANCEL`) stops a running levelling, calibration or manual turn. See [Cancelling a run](#cancelling-a-run).
 - `SCREWS_TILT_ADJUST_AUTO` measures the bed and turns the screws until it is level, then homes Z if any screw was moved.
@@ -67,6 +69,7 @@ managed_services: klipper
   Readings use Klipper's own `METHOD=scan` probing, so drift compensation and the probe's calibrated range all apply. Only how the reading changes is used, so it doesn't matter if it's slightly offset from the full measurement. It needs a `[probe_eddy_current]` probe and a Klipper version from mid 2024 or later. It can be combined with `WAIT_FOR_HEATERS=1`.
 - `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns> [FORCE=1]` turns one screw motor by the given number of turns (negative for counter-clockwise). Turns bigger than `max_turns_per_move` are refused unless you add `FORCE=1`.
 - Add `DIALOG=1` to `SCREWS_TILT_ADJUST_AUTO`, `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` or `SCREWS_TILT_ADJUST_MANUAL` to show a dialog with a Cancel button while it runs, as the `LEVEL_BED_SCREWS` dialog does.
+- `SCREWS_TILT_ADJUST_AUTO_TEST` checks each motor is wired to the right screw and turns it the right way. See [Testing the motors](#testing-the-motors).
 - `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` measures how fast each motor turns each way, and its backlash, so screws get level in fewer tries. See [Motor calibration and backlash](#motor-calibration-and-backlash).
 
 Optional settings for continuous mode, in the `[screws_tilt_adjust_auto]` section:
@@ -103,15 +106,35 @@ Press **Cancel** in the dialog, or send `CANCEL_LEVEL_BED_SCREWS` or `SCREWS_TIL
 - Nothing more is measured or homed. If any screw was turned, it says so: home Z (`G28 Z`) before printing, since the bed has moved. Learned motor speeds are kept, and a cancelled calibration saves nothing.
 
 The run ends with a "Cancelled" error, so a macro that started it stops too. A cancel from inside another macro or a print file waits its turn like any other command, so it can't stop a run.
+### Testing the motors
+`SCREWS_TILT_ADJUST_AUTO_TEST` finds wiring and coupling problems with small turns, before a real run makes big ones. Run it after building or rewiring, or whenever a run stops with one of the errors above.
+
+1. Measures the whole bed.
+2. For each motor, turns it clockwise by `test_turns` (half a turn by default), measures the whole bed again, then turns it back and measures again.
+3. Stops at the first motor that fails, after turning it back, and says what's wrong:
+   - **moved the wrong screw**: the motor is plugged into another screw's port.
+   - **turns the wrong way**: swap the motor's two wires.
+   - **barely moved**: the motor isn't plugged in, or its coupling is slipping.
+   - **didn't come back**: the motor only works one way, or slips against the springs.
+   - **moved far more than expected**: `full_turn_time_in_seconds` or the calibrated speeds are badly off.
+
+`CONTINUOUS=1` uses an eddy current probe instead. It parks the probe over each screw and watches it while the motor turns, which is much quicker. If a screw doesn't move, it tries the other motors to find which one does move it. `TURNS=<turns>` sets how far each motor turns. It must move the bed clearly more than the probe's noise (`reading_tolerance`), and no more than `max_turns_per_move`.
+
+It needs `screw_thread` set in `[screws_tilt_adjust]` to know which way is right. Calibration runs the test first, so add `TEST=0` to `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` to skip it.
+
+```ini
+test_turns: 0.5    # how far each motor turns in the test, in turns
+```
 
 ### Motor calibration and backlash
 Each motor runs at its own speed, and at a different speed each way, because one way works against the bed springs. Motors also take a moment to get going, and there's some slack to take up when a screw changes direction (backlash). Without calibration every motor is timed with `full_turn_time_in_seconds` and none of this is allowed for, so screws take more tries to get level, and small turns might not move at all.
 
 `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` measures all of this for each motor:
-1. Levels the bed first, so the screws are calibrated where they normally sit. Motors run slower the tighter a screw is, so this matters. Add `LEVEL=0` to skip it.
-2. For each screw, rocks it back and forth around where it sits and measures it after every move: a clockwise move to take up the slack, then two more clockwise moves of different lengths, then the same counter-clockwise. The two moves in a row give the speed and spin-up time for that direction. How far the first move after changing direction falls short gives the backlash.
-3. Puts the screw back where it started, using what it just measured.
-4. Shows the results. Run `SAVE_CONFIG` to keep them, as with Klipper's own calibration commands.
+1. [Tests the motors](#testing-the-motors), so a wiring fault is found with small turns. Add `TEST=0` to skip it.
+2. Levels the bed first, so the screws are calibrated where they normally sit. Motors run slower the tighter a screw is, so this matters. Add `LEVEL=0` to skip it.
+3. For each screw, rocks it back and forth around where it sits and measures it after every move: a clockwise move to take up the slack, then two more clockwise moves of different lengths, then the same counter-clockwise. The two moves in a row give the speed and spin-up time for that direction. How far the first move after changing direction falls short gives the backlash.
+4. Puts the screw back where it started, using what it just measured.
+5. Shows the results. Run `SAVE_CONFIG` to keep them, as with Klipper's own calibration commands.
 
 Options: `SCREW=<n>` calibrates just one screw. `CONTINUOUS=1` watches the screw with an eddy current probe instead of probing it after every move, which is quicker and more precise. `TURNS=<turns>` sets the size of the shortest move (default `calibration_turns`); use a bigger one if it says the backlash is more than the calibration moves. `CYCLES=<n>` sets how many times it goes back and forth (default `calibration_cycles`).
 

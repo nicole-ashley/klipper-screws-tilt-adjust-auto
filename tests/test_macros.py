@@ -78,6 +78,16 @@ class TestLevelBedScrewsDialog(unittest.TestCase):
         self.assertEqual(len(buttons), 3)
         self.assertIn("MODE=continuous", buttons[2])
 
+    def test_test_motors_button(self):
+        footer = [l for l in self.dialog() if "prompt_footer_button Test motors" in l]
+        self.assertEqual(len(footer), 1)
+        self.assertTrue(footer[0].endswith('MODE=test"'))
+        settings = {"respond": {}, "probe_eddy_current btt_eddy": {}}
+        footer = [l for l in self.dialog(settings=settings)
+                  if "prompt_footer_button Test motors" in l]
+        self.assertEqual(len(footer), 1)
+        self.assertTrue(footer[0].endswith('MODE=test_continuous"'))
+
     def test_lists_heaters_with_a_target(self):
         lines = self.dialog(heaters={
             "heater_bed": (41.2, 60.0),
@@ -124,6 +134,9 @@ class TestLevelBedScrewsRun(unittest.TestCase):
                          "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 ONE_BY_ONE=1 DIALOG=1")
         self.assertEqual(self.run_mode("continuous")[-1],
                          "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 CONTINUOUS=1 DIALOG=1")
+        self.assertEqual(self.run_mode("test")[-1], "SCREWS_TILT_ADJUST_AUTO_TEST DIALOG=1")
+        self.assertEqual(self.run_mode("test_continuous")[-1],
+                         "SCREWS_TILT_ADJUST_AUTO_TEST CONTINUOUS=1 DIALOG=1")
 
     def test_cancel_closes_dialog(self):
         lines = render(self.macros["_LEVEL_BED_SCREWS_CLOSE"], printer_state())
