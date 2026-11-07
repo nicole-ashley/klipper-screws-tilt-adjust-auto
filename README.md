@@ -45,7 +45,7 @@ managed_services: klipper
 
   A **Test motors** button runs `SCREWS_TILT_ADJUST_AUTO_TEST` (with `CONTINUOUS=1` when you have an eddy current probe).
 
-  Every option runs with `WAIT_FOR_HEATERS=1`, so if the heaters are warming up it levels now and again at temperature. With no heaters on, or all at temperature, it levels once. While it runs, a dialog with a **Cancel** button stays open. Needs the `[include]` line above.
+  Every option runs with `WAIT_FOR_HEATERS=1`, so if the heaters are warming up it levels now and again at temperature. With no heaters on, or all at temperature, it levels once. While it runs, a dialog shows its progress and has a **Cancel** button. See [Progress](#progress). Needs the `[include]` line above.
 - `CANCEL_LEVEL_BED_SCREWS` (or `SCREWS_TILT_ADJUST_AUTO_CANCEL`) stops a running levelling, calibration or manual turn. See [Cancelling a run](#cancelling-a-run).
 - `SCREWS_TILT_ADJUST_AUTO` measures the bed and turns the screws until it is level, then homes Z if any screw was moved.
 - `SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 [HEATERS=heater_bed,extruder]` levels while the heaters warm up, then again once they're at temperature to cater for heat flex:
@@ -68,7 +68,7 @@ managed_services: klipper
 
   Readings use Klipper's own `METHOD=scan` probing, so drift compensation and the probe's calibrated range all apply. Only how the reading changes is used, so it doesn't matter if it's slightly offset from the full measurement. It needs a `[probe_eddy_current]` probe and a Klipper version from mid 2024 or later. It can be combined with `WAIT_FOR_HEATERS=1`.
 - `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns> [FORCE=1]` turns one screw motor by the given number of turns (negative for counter-clockwise). Turns bigger than `max_turns_per_move` are refused unless you add `FORCE=1`.
-- Add `DIALOG=1` to `SCREWS_TILT_ADJUST_AUTO`, `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` or `SCREWS_TILT_ADJUST_MANUAL` to show a dialog with a Cancel button while it runs, as the `LEVEL_BED_SCREWS` dialog does.
+- Add `DIALOG=1` to `SCREWS_TILT_ADJUST_AUTO`, `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` or `SCREWS_TILT_ADJUST_MANUAL` to show a progress dialog with a Cancel button while it runs, as the `LEVEL_BED_SCREWS` dialog does.
 - `SCREWS_TILT_ADJUST_AUTO_TEST` checks each motor is wired to the right screw and turns it the right way. See [Testing the motors](#testing-the-motors).
 - `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` measures how fast each motor turns each way, and its backlash, so screws get level in fewer tries. See [Motor calibration and backlash](#motor-calibration-and-backlash).
 
@@ -88,6 +88,39 @@ To see every step (each motor run and how long for, each reading of a single scr
 debug: True     # DEBUG=0 on a command turns it off for that run
 ```
 Everything Klipper prints still goes to `klippy.log` either way, and if a single screw measurement fails, the readings it held back are shown with the error.
+
+### Progress
+While a run is going, Mainsail, Fluidd and KlipperScreen can show where it's up to. Klipper runs one command at a time, so macros like `M117` can't run during a run. These come from the extra itself instead.
+
+- **Dialog.** With `DIALOG=1` (which `LEVEL_BED_SCREWS` uses), the dialog is redrawn at each step. It shows the pass, what's happening now, each screw's distance from the reference screw and the turn it needs, and the spread between the highest and lowest screw:
+  ```
+  Levelling bed screws
+  Pass 2 of up to 10, heaters warming up
+  Turning rear right CW 00:05
+  front left: reference
+  front right: level
+  rear right: +0.042mm, CW 00:05
+  rear left: -0.018mm, CCW 00:02
+  Spread 0.060mm, started at 0.210mm
+                                [Cancel]
+  ```
+  Screws are named as in `[screws_tilt_adjust]`. When the run ends, the dialog shows a summary (passes, where each screw ended up, the spread and how far each screw turned) with a **Close** button. If it fails, it shows why. If you cancel, it just closes, unless screws were turned, when it reminds you to home Z. Closing the dialog during a run keeps it closed; the status line carries on.
+- **Status line.** The message `M117` would set shows the current step, such as "Levelling: Turning rear right CW 00:05", in Mainsail's and Fluidd's status panel, on KlipperScreen and on printer screens. It goes back to what it was when the run ends.
+- **Status fields.** `printer.screws_tilt_adjust_auto` has the details, for macros and anything else that reads Klipper's status:
+
+  | Field | Meaning |
+  | --- | --- |
+  | `state` | `idle`, `starting`, `homing`, `measuring`, `turning`, `waiting_for_heaters`, `calibrating`, then `done`, `failed` or `cancelled` when it ends |
+  | `running` | whether a run is going |
+  | `mode` | `level`, `calibrate`, `test` or `manual` |
+  | `heaters` | `warming_up` or `at_temperature` with `WAIT_FOR_HEATERS=1`, otherwise empty |
+  | `pass`, `max_passes` | the current full measurement, and `maximum_attempts` |
+  | `screw` | the screw being measured or turned |
+  | `message` | the current step, as on the status line |
+  | `screws` | each screw's `name`, `deviation` (mm from the reference screw), `turns` still needed, `level` and `reference` |
+  | `spread`, `start_spread` | mm between the highest and lowest screw, now and at the first measurement |
+  | `run_turns` | how far each screw has turned this run |
+  | `error` | why the last run failed |
 
 ### Safety limits
 So that a bad reading or a motor wired the wrong way can't wind a screw out of the bed, every run stops with an error, and leaves the motors stopped, if:

@@ -161,20 +161,32 @@ class CancelTest(TestBase):
         self.assertLessEqual(self.reactor.now, 0.5 + staa.CANCEL_CHECK_INTERVAL)
         self.assert_motors_stopped()
 
-    def test_dialog_has_a_cancel_button_and_closes_after(self):
+    def test_dialog_has_a_cancel_button_then_a_summary(self):
         obj = self.make([OFF, LEVEL])
         obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"DIALOG": 1}))
         self.assertEqual(self.gcode.raw[0], "// action:prompt_begin Levelling bed screws")
         self.assertIn("// action:prompt_footer_button Cancel|SCREWS_TILT_ADJUST_AUTO_CANCEL|error",
                       self.gcode.raw)
-        self.assertEqual(self.gcode.raw[-2:], ["// action:prompt_show", "// action:prompt_end"])
+        self.assertIn("// action:prompt_text Bed screws level", self.gcode.raw)
+        self.assertEqual(self.gcode.raw[-2:], [
+            "// action:prompt_footer_button Close|_SCREWS_TILT_ADJUST_AUTO_CLOSE_DIALOG",
+            "// action:prompt_show"])
 
-    def test_dialog_closes_after_a_cancel_or_error(self):
-        for rounds, cancel_at in (([OFF, LEVEL], 1.0), ([OFF, RuntimeError("probe")], None)):
-            obj = self.make(rounds, cancel_at=cancel_at)
-            with self.assertRaises(Exception):
-                obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"DIALOG": 1}))
-            self.assertEqual(self.gcode.raw[-1], "// action:prompt_end")
+    def test_dialog_says_to_home_z_after_a_cancel_mid_turn(self):
+        # The first wait is the first motor turn, after probing
+        obj = self.make([OFF, LEVEL], cancel_at=1.0)
+        with self.assertRaises(CommandError):
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"DIALOG": 1}))
+        self.assertIn("// action:prompt_text Cancelled", self.gcode.raw)
+        self.assertIn("// action:prompt_text Screws were turned, so home Z (G28 Z)"
+                      " before printing.", self.gcode.raw)
+
+    def test_dialog_shows_an_error(self):
+        obj = self.make([OFF, RuntimeError("probe failed")])
+        with self.assertRaises(RuntimeError):
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"DIALOG": 1}))
+        self.assertIn("// action:prompt_text Stopped: probe failed", self.gcode.raw)
+        self.assertEqual(self.gcode.raw[-1], "// action:prompt_show")
 
     def test_no_dialog_unless_asked(self):
         obj = self.make([OFF, LEVEL])
