@@ -84,8 +84,8 @@ class FakeCommand:
         self.params = params
 
 
-def make_continuous(heights, efficiency=1., attempts=10, eddy=True):
-    obj, bed, gcode, sta = make(heights, efficiency, attempts)
+def make_continuous(heights, efficiency=1., attempts=10, eddy=True, config=None):
+    obj, bed, gcode, sta = make(heights, efficiency, attempts, config=config)
     toolhead = FakeToolhead()
     probe = FakeEddyProbe(bed, toolhead)
     gcode.create_gcode_command = lambda cmd, line, params: FakeCommand(params)
@@ -140,7 +140,7 @@ class ContinuousTest(unittest.TestCase):
 
     def test_screw_that_never_settles_fails_and_cleans_up(self):
         obj, bed, gcode, probe, toolhead = make_continuous(
-            [0., 0.2, -0.1], efficiency=0., attempts=3)
+            [0., 0.2, -0.1], efficiency=0.3, attempts=2)
         with self.assertRaises(CommandError) as ctx:
             obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"CONTINUOUS": 1}))
         self.assertIn("Unable to reach level", str(ctx.exception))
