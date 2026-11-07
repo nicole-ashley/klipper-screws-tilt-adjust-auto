@@ -25,6 +25,59 @@ MAX_TURNS_PER_MM = 1 / 0.4
 # be compared to screw_thread
 MIN_SPREAD_TO_CHECK_THREAD = 0.05
 
+# The board drives up to four motors
+MAX_MOTORS = 4
+CW = 1
+CCW = -1
+DIRECTION_NAMES = {CW: "cw", CCW: "ccw"}
+# How far a learned speed moves toward each new reading. Small enough that
+# one odd reading can't take over.
+LEARNING_RATE = 0.3
+# A turn that suggests a speed further off than this from the current one is
+# more likely a bad reading than the motor, so it isn't learned from
+MAX_LEARNING_RATIO = 2.
+# Calibration moves each motor for 2x, 1x and 2x a short time one way, then
+# the same back, so the screw ends up where it started. The first move after
+# reversing takes up the slack, and how far it falls short shows the
+# backlash. The two moves after it, of different lengths, separate the
+# motor's speed from its spin-up time.
+CALIBRATION_PATTERN = [(CW, 2), (CW, 1), (CW, 2), (CCW, 2), (CCW, 1), (CCW, 2)]
+# Prefix for values kept with [save_variables]
+VARIABLE_PREFIX = "staa_motor"
+
+
+class MotorModel:
+    """How long to run one motor for a given turn. Turning direction
+    changes how fast the motor runs, since one way works against the bed
+    springs, so each direction has its own speed and spin-up time. Backlash
+    is the slack taken up when the motor changes direction, in turns, so it
+    doesn't depend on how fast the motor runs."""
+
+    def __init__(self, config, number, default_seconds_per_turn):
+        self.number = number
+        self.seconds_per_turn = {}
+        self.spin_up_time = {}
+        for direction, name in DIRECTION_NAMES.items():
+            self.seconds_per_turn[direction] = config.getfloat(
+                "motor%d_%s_seconds_per_turn" % (number, name),
+                default_seconds_per_turn, above=0.)
+            self.spin_up_time[direction] = config.getfloat(
+                "motor%d_%s_spin_up_time" % (number, name), 0.)
+        self.backlash = config.getfloat("motor%d_backlash" % (number,), 0., minval=0.)
+        # Which way the motor last turned, if known, for backlash
+        self.last_direction = None
+
+    def seconds_for(self, turns):
+        # Run time for a turn, and the backlash added to it in turns
+        direction = CW if turns > 0 else CCW
+        backlash = 0.
+        if self.last_direction is not None and self.last_direction != direction:
+            backlash = self.backlash
+        seconds = self.spin_up_time[direction] + \
+            (abs(turns) + backlash) * self.seconds_per_turn[direction]
+        return max(seconds, 0.), backlash
+
+
 class ScrewsTiltAdjustAuto:
     def __init__(self, config):
         self.active = False
@@ -39,6 +92,13 @@ class ScrewsTiltAdjustAuto:
         self.max_turns_per_run = config.getfloat("max_turns_per_run", 3., above=0.)
         self.max_deviation = config.getfloat("max_deviation", 2., above=0.)
         self.reading_tolerance = config.getfloat("reading_tolerance", 0.02, minval=0.)
+        self.learn_motor_speed = config.getboolean("learn_motor_speed", True)
+        self.calibration_turns = config.getfloat("calibration_turns", 0.125, above=0.)
+        self.calibration_cycles = config.getint("calibration_cycles", 2, minval=1)
+        self.motors = [MotorModel(config, number, self.full_turn_time_in_seconds)
+                       for number in range(1, MAX_MOTORS + 1)]
+        # Details of the last turn, for learning from how far it went
+        self.last_turn = None
         self.run_turns = None
         self.board = None
         self.one_by_one = False
@@ -54,6 +114,9 @@ class ScrewsTiltAdjustAuto:
         self.gcode.register_command("SCREWS_TILT_ADJUST_MANUAL",
                                     self.cmd_SCREWS_TILT_ADJUST_MANUAL,
                                     desc=self.cmd_SCREWS_TILT_ADJUST_MANUAL_help)
+        self.gcode.register_command("SCREWS_TILT_ADJUST_AUTO_CALIBRATE",
+                                    self.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE,
+                                    desc=self.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE_help)
         self.gcode.register_output_handler(self._handle_output)
 
     def _handle_output(self, output):
@@ -121,12 +184,14 @@ class ScrewsTiltAdjustAuto:
         if not force:
             self._check_move_size(directions, "Add FORCE=1 to turn it anyway.")
 
+        self._load_motor_state()
         self._connect_to_board()
         try:
             self.gcode.respond_info("STAA: " + ",".join(map(str, directions)))
             self._turn_motors(directions)
         finally:
             self._disconnect_from_board()
+            self._save_motor_state()
 
     cmd_SCREWS_TILT_ADJUST_AUTO_help = "Tool to automatically adjust bed level screws"
     def cmd_SCREWS_TILT_ADJUST_AUTO(self, gcmd):
@@ -140,10 +205,12 @@ class ScrewsTiltAdjustAuto:
             self._lookup_scanning_probe()
         # Turns made by each screw in this run, however many passes it takes
         self.run_turns = {}
+        self._load_motor_state()
         try:
             self._adjust(gcmd)
         finally:
             self.run_turns = None
+            self._save_motor_state()
 
     def _adjust(self, gcmd):
         if gcmd.get_int("WAIT_FOR_HEATERS", 0, minval=0, maxval=1):
@@ -231,6 +298,7 @@ class ScrewsTiltAdjustAuto:
                     new_height = read()
                     stalled = self._check_screw_progress(
                         screw, movement, target, height, new_height, stalled)
+                    self._learn_from_turn(screw, height, new_height)
                     height = new_height
                     movement = self._height_to_turns(target - height)
                     if movement == 0:
@@ -508,8 +576,8 @@ class ScrewsTiltAdjustAuto:
         if abs(target - after) > abs(target - before) + self.reading_tolerance:
             raise self.gcode.error(
                 "STAA: Screw %d got further from level after turning (%.3fmm to %.3fmm)."
-                " Check its motor turns the right way and full_turn_time_in_seconds,"
-                " then retry." % (screw + 1, abs(target - before), abs(target - after)))
+                " Check its motor turns the right way, then retry, or run"
+                " SCREWS_TILT_ADJUST_AUTO_CALIBRATE." % (screw + 1, abs(target - before), abs(target - after)))
         expected = abs(movement / self.turns_per_mm)
         if expected < 2 * self.reading_tolerance:
             # Too small a move to tell from the readings' noise
@@ -585,27 +653,310 @@ class ScrewsTiltAdjustAuto:
             self._check_move_size(
                 movements, "Check the bed and probe, or raise max_turns_per_move.")
             self._check_run_total(movements)
-        for motor, distance in enumerate(movements, start=1):
+        self.last_turn = None
+        for screw, distance in enumerate(movements):
             if distance == 0:
                 continue
             if self.run_turns is not None:
-                self.run_turns[motor - 1] = self.run_turns.get(motor - 1, 0.) + abs(distance)
-            if distance < 0:
-                motor *= -1
+                self.run_turns[screw] = self.run_turns.get(screw, 0.) + abs(distance)
+            motor = self._motor(screw)
+            seconds, backlash = motor.seconds_for(distance)
+            direction = CW if distance > 0 else CCW
+            self._run_motor(screw, direction, seconds)
+            self.last_turn = (screw, direction, abs(distance), seconds, backlash)
 
-            wait_time = abs(distance) * self.full_turn_time_in_seconds
-            self.gcode.respond_info("STAA: " + str(motor) + " for " + str(wait_time) + " seconds.")
-            command = str(motor).encode()
+        self._stop_motors()
+
+    def _motor(self, screw):
+        if screw < len(self.motors):
+            return self.motors[screw]
+        # More screws than the board has motors: the board ignores these,
+        # so the default timing is as good as any
+        return MotorModel(_NoConfig(), screw + 1, self.full_turn_time_in_seconds)
+
+    def _run_motor(self, screw, direction, seconds):
+        # Run one motor for the given time. The next command to the board
+        # stops it, so callers stop the motors when they're done.
+        motor = (screw + 1) * direction
+        self.gcode.respond_info("STAA: %d for %.3f seconds." % (motor, seconds))
+        command = str(motor).encode()
+        self.board.write(command)
+        wait_time = seconds
+        while wait_time > MOTOR_KEEPALIVE_INTERVAL:
+            self._pause(MOTOR_KEEPALIVE_INTERVAL)
+            wait_time -= MOTOR_KEEPALIVE_INTERVAL
+            # Tells the board to keep this motor running
             self.board.write(command)
-            while wait_time > MOTOR_KEEPALIVE_INTERVAL:
-                self._pause(MOTOR_KEEPALIVE_INTERVAL)
-                wait_time -= MOTOR_KEEPALIVE_INTERVAL
-                # Tells the board to keep this motor running
-                self.board.write(command)
-            self._pause(wait_time)
+        self._pause(wait_time)
+        self._motor(screw).last_direction = direction
 
+    def _stop_motors(self):
         self.gcode.respond_info("STAA: Stopping motors.")
         self.board.write("0".encode())
+
+    def _learn_from_turn(self, screw, before, after):
+        # Compare how far the screw actually went with how far it was asked
+        # to, and move that direction's speed part of the way toward what
+        # this turn suggests. Turns too small to tell from the probe's noise,
+        # and ones that suggest an unlikely speed, are skipped.
+        if not self.learn_motor_speed or self.last_turn is None:
+            return
+        turned_screw, direction, asked, seconds, backlash = self.last_turn
+        if turned_screw != screw:
+            return
+        if abs(asked / self.turns_per_mm) < 2 * self.reading_tolerance:
+            return
+        moved = (after - before) * self.turns_per_mm * direction
+        if moved <= 0:
+            return
+        motor = self._motor(screw)
+        running = seconds - motor.spin_up_time[direction]
+        if running <= 0:
+            return
+        current = motor.seconds_per_turn[direction]
+        estimate = running / (moved + backlash)
+        if not 1. / MAX_LEARNING_RATIO <= estimate / current <= MAX_LEARNING_RATIO:
+            return
+        motor.seconds_per_turn[direction] = current + LEARNING_RATE * (estimate - current)
+
+    def _variables(self):
+        # Values kept with Klipper's [save_variables], or None without it
+        save_variables = self.printer.lookup_object('save_variables', None)
+        if save_variables is None:
+            return None
+        return save_variables.get_status(self.reactor.monotonic()).get("variables", {})
+
+    def _variable_names(self, motor):
+        prefix = "%s%d_" % (VARIABLE_PREFIX, motor.number)
+        speeds = dict((direction, prefix + name + "_seconds_per_turn")
+                      for direction, name in DIRECTION_NAMES.items())
+        return speeds, prefix + "last_direction"
+
+    def _load_motor_state(self):
+        # Learned speeds and each motor's last direction, from earlier runs.
+        # Learned speeds win over the config, since they started from it.
+        variables = self._variables()
+        if variables is None:
+            return
+        for motor in self.motors:
+            speeds, last_direction = self._variable_names(motor)
+            if last_direction in variables:
+                motor.last_direction = variables[last_direction] or None
+            if not self.learn_motor_speed:
+                continue
+            for direction, name in speeds.items():
+                value = variables.get(name)
+                if isinstance(value, (int, float)) and value > 0:
+                    motor.seconds_per_turn[direction] = float(value)
+
+    def _save_motor_state(self):
+        # Keep learned speeds and last directions for the next run. Klipper's
+        # SAVE_CONFIG restarts Klipper, so these go in [save_variables].
+        variables = self._variables()
+        if variables is None:
+            return
+        try:
+            for motor in self.motors:
+                speeds, last_direction = self._variable_names(motor)
+                values = {last_direction: motor.last_direction or 0}
+                if self.learn_motor_speed:
+                    for direction, name in speeds.items():
+                        values[name] = round(motor.seconds_per_turn[direction], 4)
+                for name, value in sorted(values.items()):
+                    if variables.get(name) != value:
+                        self.gcode.run_script_from_command(
+                            "SAVE_VARIABLE VARIABLE=%s VALUE=%r" % (name, value))
+        except self.gcode.error as e:
+            # Don't hide whatever the run itself reported
+            self.gcode.respond_info("STAA: Couldn't save motor speeds: %s" % (e,))
+
+    cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE_help = \
+        "Measure how fast each screw motor turns each way, and its backlash"
+    def cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(self, gcmd):
+        self.continuous = bool(gcmd.get_int("CONTINUOUS", 0, minval=0, maxval=1))
+        self.one_by_one = True
+        level_first = bool(gcmd.get_int("LEVEL", 1, minval=0, maxval=1))
+        cycles = gcmd.get_int("CYCLES", self.calibration_cycles, minval=1)
+        turns = gcmd.get_float("TURNS", self.calibration_turns, above=0.)
+        screw = gcmd.get_int("SCREW", None, minval=1)
+        if self.continuous:
+            self._lookup_scanning_probe()
+        # Every move is checked on its own, but the back and forth adds up
+        # past max_turns_per_run without going anywhere, so only the
+        # levelling counts toward it
+        self._check_move_size([turns * 2], "Use a smaller TURNS.")
+        self._load_motor_state()
+        try:
+            if level_first:
+                # Calibrate where the screws normally sit, since the motors
+                # run slower the tighter a screw is. Motors that are far off
+                # might not quite get there before they're calibrated, which
+                # is close enough.
+                self.run_turns = {}
+                if not self._auto_adjust():
+                    self.gcode.respond_info(
+                        "STAA: Couldn't fully level first, calibrating from here")
+                self.run_turns = None
+            results = self._calibrate(gcmd, screw, turns, cycles)
+        finally:
+            self.run_turns = None
+            self._save_motor_state()
+        self._store_calibration(results)
+
+    def _calibrate(self, gcmd, screw, turns, cycles):
+        self.gcode.respond_info("STAA: Calibrating motors")
+        self._home_if_necessary()
+        self._connect_to_board()
+        try:
+            self._measure_bed_tilt()
+            count = len(self.heights)
+            if screw is not None and screw > count:
+                raise gcmd.error("Error on '%s': STAA: There are only %d screws" % (
+                    gcmd.get_commandline(), count))
+            self.turns_per_mm = self._calibration_turns_per_mm()
+            screws = range(count) if screw is None else [screw - 1]
+            results = []
+            for index in screws:
+                with self._screw_reader(index) as read:
+                    results.append(self._calibrate_screw(index, read, turns, cycles))
+        finally:
+            self._disconnect_from_board()
+        self.gcode.respond_info("STAA: Homing Z as bed level will have changed")
+        self.gcode.run_script_from_command("G28 Z")
+        return results
+
+    def _calibration_turns_per_mm(self):
+        expected = self._screw_thread_turns_per_mm()
+        if expected is not None:
+            return expected
+        try:
+            self._learn_turns_per_mm()
+        except self.gcode.error:
+            raise self.gcode.error(
+                "STAA: Can't tell how far a turn moves the bed. This Klipper version"
+                " doesn't say which screw_thread is set, so calibrate with the bed"
+                " slightly out of level and LEVEL=0.")
+        return self.turns_per_mm
+
+    def _calibrate_screw(self, screw, read, turns, cycles):
+        # Rock the screw back and forth around where it sits, measuring after
+        # every move, then put it back where it started. Returns the motor's
+        # new values.
+        motor = self._motor(screw)
+        self.gcode.respond_info("STAA: Calibrating screw %d" % (screw + 1,))
+        # Seconds for the shortest move each way, from what's known so far
+        base = dict((d, motor.spin_up_time[d] + turns * motor.seconds_per_turn[d])
+                    for d in DIRECTION_NAMES)
+        steady = {CW: [], CCW: []}
+        reversals = []
+        previous = motor.last_direction
+        start = height = read()
+        for cycle in range(cycles):
+            for direction, multiple in CALIBRATION_PATTERN:
+                seconds = max(base[direction], 0.01) * multiple
+                self._run_motor(screw, direction, seconds)
+                self._stop_motors()
+                new_height = read()
+                moved = (new_height - height) * self.turns_per_mm * direction
+                height = new_height
+                if previous == direction:
+                    steady[direction].append((seconds, moved))
+                elif previous is not None:
+                    if moved < self.reading_tolerance * abs(self.turns_per_mm):
+                        # The slack may not all be taken up, so the next
+                        # moves would be off and the backlash can't be told
+                        raise self.gcode.error(
+                            "STAA: Screw %d barely moved after changing direction, so its"
+                            " backlash is more than the calibration moves. Use a bigger"
+                            " TURNS." % (screw + 1,))
+                    reversals.append((direction, seconds, moved))
+                # The very first move takes up any slack, and how much there
+                # was isn't known, so it's not used
+                previous = direction
+            # Use what this cycle found so both ways move the same distance
+            # next time, keeping the screw around the same spot
+            for d in DIRECTION_NAMES:
+                rate, offset = self._fit_speed(screw, d, steady[d])
+                base[d] = (turns - offset) / rate
+        fits = dict((d, self._fit_speed(screw, d, steady[d])) for d in DIRECTION_NAMES)
+        backlash = [fits[d][0] * seconds + fits[d][1] - moved
+                    for d, seconds, moved in reversals]
+        backlash = max(0., sum(backlash) / len(backlash))
+        if backlash > self.max_turns_per_move:
+            raise self.gcode.error(
+                "STAA: Screw %d seems to have %.2f turns of backlash, which is more"
+                " likely bad readings. Check the probe and motor coupling, then retry." % (
+                    screw + 1, backlash))
+        result = {"backlash": backlash}
+        for d, (rate, offset) in fits.items():
+            result[d] = (1. / rate, -offset / rate)
+        self._return_to(screw, (start - height) * self.turns_per_mm, previous, result)
+        return screw, result
+
+    def _return_to(self, screw, distance, previous, result):
+        # Turn the screw back to where calibration started, using the
+        # values it just found
+        if abs(distance) * 60 < 0.5:
+            return
+        self._check_move_size([distance], "Check the probe and motor coupling.")
+        direction = CW if distance > 0 else CCW
+        seconds_per_turn, spin_up_time = result[direction]
+        backlash = result["backlash"] if previous != direction else 0.
+        seconds = spin_up_time + (abs(distance) + backlash) * seconds_per_turn
+        if seconds > 0:
+            self._run_motor(screw, direction, seconds)
+            self._stop_motors()
+
+    def _fit_speed(self, screw, direction, samples):
+        # Straight line fit of turns moved against seconds run, slack already
+        # taken up. Returns (turns per second, turns at zero seconds); the
+        # second is negative when the motor takes a moment to get going.
+        n = float(len(samples))
+        mean_t = sum(t for t, m in samples) / n
+        mean_m = sum(m for t, m in samples) / n
+        var = sum((t - mean_t) ** 2 for t, m in samples)
+        if var == 0:
+            raise self.gcode.error("STAA: Not enough calibration moves to fit")
+        rate = sum((t - mean_t) * (m - mean_m) for t, m in samples) / var
+        if rate <= 0:
+            raise self.gcode.error(
+                "STAA: Screw %d didn't move when its motor ran %s. Check the motor"
+                " and its coupling, then retry." % (
+                    screw + 1, "clockwise" if direction == CW else "counter-clockwise"))
+        return rate, mean_m - rate * mean_t
+
+    def _store_calibration(self, results):
+        # Use the new values now, stage them for SAVE_CONFIG like Klipper's
+        # own calibration commands do, and start learning over from them
+        configfile = self.printer.lookup_object('configfile')
+        for screw, result in results:
+            motor = self._motor(screw)
+            for direction, name in DIRECTION_NAMES.items():
+                seconds_per_turn, spin_up_time = result[direction]
+                motor.seconds_per_turn[direction] = seconds_per_turn
+                motor.spin_up_time[direction] = spin_up_time
+                configfile.set("screws_tilt_adjust_auto",
+                               "motor%d_%s_seconds_per_turn" % (motor.number, name),
+                               "%.4f" % (seconds_per_turn,))
+                configfile.set("screws_tilt_adjust_auto",
+                               "motor%d_%s_spin_up_time" % (motor.number, name),
+                               "%.4f" % (spin_up_time,))
+            motor.backlash = result["backlash"]
+            configfile.set("screws_tilt_adjust_auto", "motor%d_backlash" % (motor.number,),
+                           "%.4f" % (result["backlash"],))
+            self.gcode.respond_info(
+                "STAA: Motor %d: clockwise %.3fs per turn (%.3fs spin-up),"
+                " counter-clockwise %.3fs per turn (%.3fs spin-up), backlash %.3f turns" % (
+                    motor.number, result[CW][0], result[CW][1],
+                    result[CCW][0], result[CCW][1], result["backlash"]))
+        self._save_motor_state()
+        self.gcode.respond_info(
+            "STAA: Calibration done. Run SAVE_CONFIG to keep these values.")
+
+
+class _NoConfig:
+    def getfloat(self, name, default=None, **kwargs):
+        return default
 
 
 def load_config(config):
