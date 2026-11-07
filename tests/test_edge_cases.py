@@ -37,10 +37,13 @@ class OutputParsingTest(unittest.TestCase):
 
 class BoardConnectionTest(TestBase):
     def use_serial(self, reads):
+        opened = []
+
         class Serial(FakeBoard):
             def __init__(self, **kwargs):
                 FakeBoard.__init__(self)
                 self.kwargs = kwargs
+                opened.append(self)
 
             def read(self, n):
                 return reads.pop(0) if reads else b""
@@ -48,6 +51,7 @@ class BoardConnectionTest(TestBase):
         original = staa.serial.Serial
         staa.serial.Serial = Serial
         self.addCleanup(setattr, staa.serial, "Serial", original)
+        return opened
 
     def test_opens_the_configured_port(self):
         obj = self.make([])
@@ -58,15 +62,26 @@ class BoardConnectionTest(TestBase):
             "port": "/dev/null", "baudrate": 115200, "timeout": 0})
         self.assertEqual(self.reactor.paused, 0.)
 
-    def test_stops_waiting_for_handshake_after_timeout(self):
+    def test_no_handshake_is_an_error(self):
         obj = self.make([])
         del obj._connect_to_board
-        self.use_serial([])
-        obj._connect_to_board()
-        # Gives up waiting, but keeps the connection open
-        self.assertIsNotNone(obj.board)
+        boards = self.use_serial([])
+        with self.assertRaises(HeaterCommandError) as ctx:
+            obj._connect_to_board()
+        self.assertIn("No response from the board on /dev/null", str(ctx.exception))
         self.assertGreaterEqual(self.reactor.now, staa.HANDSHAKE_TIMEOUT)
         self.assertLess(self.reactor.now, staa.HANDSHAKE_TIMEOUT + 0.1)
+        # The port is closed again
+        self.assertTrue(boards[0].closed)
+        self.assertIsNone(obj.board)
+
+    def test_no_handshake_stops_the_command_before_measuring(self):
+        obj = self.make([LEVEL])
+        del obj._connect_to_board
+        self.use_serial([])
+        with self.assertRaises(HeaterCommandError):
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(HeaterGcmd())
+        self.assertEqual(self.calculate_count(), 0)
 
     def test_disconnect_without_a_board_does_nothing(self):
         obj = self.make([])
@@ -96,6 +111,14 @@ class ManualCommandTest(TestBase):
         obj = self.make([])
         with self.assertRaises(HeaterCommandError):
             obj.cmd_SCREWS_TILT_ADJUST_MANUAL(HeaterGcmd({"DISTANCE": 0.5}))
+        self.assertEqual(self.boards, [])
+
+    def test_screw_below_1_is_an_error(self):
+        obj = self.make([])
+        for screw in (0, -1):
+            with self.assertRaises(HeaterCommandError) as ctx:
+                obj.cmd_SCREWS_TILT_ADJUST_MANUAL(HeaterGcmd({"SCREW": screw, "DISTANCE": 0.5}))
+            self.assertIn("SCREW must be 1 or more", str(ctx.exception))
         self.assertEqual(self.boards, [])
 
     def test_missing_distance_is_an_error(self):
@@ -135,6 +158,17 @@ class MotorMovementsTest(TestBase):
     def test_all_anticlockwise_moves_base_screw_instead(self):
         self.assertEqual(self.movements([
             adjust("b", "CCW", "01:00"), adjust("c", "CCW", "00:30")]), [0.5, -0.5, 0])
+
+
+class UnreadableOutputTest(TestBase):
+    def test_no_adjustments_read_is_an_error_not_level(self):
+        # e.g. if Klipper changed how SCREWS_TILT_CALCULATE reports results
+        obj = self.make([["// screw2 is 0.1mm out"]])
+        with self.assertRaises(HeaterCommandError) as ctx:
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(HeaterGcmd())
+        self.assertIn("Couldn't read any screw adjustments", str(ctx.exception))
+        self.assertEqual(self.home_z_count(), 0)
+        self.assert_motors_stopped()
 
 
 class HeaterListTest(TestBase):

@@ -106,6 +106,8 @@ class FakeGcode:
     """Plays back SCREWS_TILT_CALCULATE results, one list of lines per call.
     Each call takes `probe_time` seconds on the fake clock."""
 
+    error = CommandError
+
     def __init__(self, reactor, rounds, probe_time=60.):
         self.reactor = reactor
         self.rounds = list(rounds)
