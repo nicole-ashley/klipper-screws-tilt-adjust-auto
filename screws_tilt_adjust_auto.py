@@ -101,9 +101,12 @@ class ScrewsTiltAdjustAuto:
                 "Error on '%s': STAA: Unable to reach level after %s attempts. Please check manually and retry." % (
                     gcmd.get_commandline(), self.maximum_attempts,))
 
-    def _auto_adjust(self):
-        # Returns True once the bed is level, or False if it ran out of attempts
+    def _auto_adjust(self, heaters=None):
+        # Returns True once the bed is level, or False if it ran out of
+        # attempts. When heaters are given, also records whether they were
+        # at target just before the last measurement was taken.
         self.gcode.respond_info("STAA: Starting")
+        self.heaters_at_target_before_last_measurement = False
 
         self._home_if_necessary()
         self._connect_to_board()
@@ -112,6 +115,9 @@ class ScrewsTiltAdjustAuto:
 
         try:
             for i in range(self.maximum_attempts):
+                if heaters is not None:
+                    self.heaters_at_target_before_last_measurement = \
+                        self._heaters_at_target(heaters)
                 self._measure_bed_tilt()
                 movements = self._calculate_motor_movements()
                 if all(m == 0 for m in movements):
@@ -146,11 +152,13 @@ class ScrewsTiltAdjustAuto:
             return
 
         self.gcode.respond_info("STAA: Adjusting while heaters reach target")
-        level = self._auto_adjust()
+        level = self._auto_adjust(heaters)
 
-        if level and self._heaters_at_target(heaters):
+        if level and self.heaters_at_target_before_last_measurement:
+            # The measurement that found the bed level was taken at
+            # temperature, so there's no heat flex left to adjust for
             self.gcode.respond_info(
-                "STAA: Heaters reached target during adjustment, finished")
+                "STAA: Heaters were at target for the final measurement, finished")
             return
         if not level:
             # The bed is still moving as it heats, so this can happen. The

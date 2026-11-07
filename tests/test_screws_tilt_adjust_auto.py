@@ -306,12 +306,21 @@ class WaitForHeatersTest(TestBase):
         obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd(self.HEAT))
         self.assertEqual(self.home_z_count(), 0)
 
-    def test_reaches_target_during_adjustment_exits_after_one_pass(self):
-        # Two probes at 60s each, heater ready at 100s
-        obj = self.make([OFF, LEVEL], heaters={"heater_bed": (60., 100.)})
+    def test_at_target_before_final_measurement_exits_after_one_pass(self):
+        # Probes take 60s each; heater is ready at 50s, so the second
+        # (level) measurement starts at temperature
+        obj = self.make([OFF, LEVEL], heaters={"heater_bed": (60., 50.)})
         obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd(self.HEAT))
         self.assertEqual(self.calculate_count(), 2)
         self.assertEqual(self.home_z_count(), 1)
+
+    def test_reaching_target_during_final_measurement_adjusts_again(self):
+        # Heater is ready at 100s, part way through the second (level)
+        # measurement, which started at 60s, so it wasn't taken at temperature
+        obj = self.make([OFF, LEVEL, OFF, LEVEL], heaters={"heater_bed": (60., 100.)})
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd(self.HEAT))
+        self.assertEqual(self.calculate_count(), 4)
+        self.assertEqual(self.home_z_count(), 2)
 
     def test_waits_for_heaters_then_adjusts_again(self):
         obj = self.make([OFF, LEVEL, OFF, LEVEL],
