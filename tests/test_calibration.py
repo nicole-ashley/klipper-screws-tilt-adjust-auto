@@ -137,7 +137,7 @@ class CalibrationTest(unittest.TestCase):
         motors = uneven()
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], motors)
         start = list(bed.heights)
-        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0}))
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0}))
 
         self.assert_matches(obj, motors)
         section = "screws_tilt_adjust_auto"
@@ -155,7 +155,7 @@ class CalibrationTest(unittest.TestCase):
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], motors)
         obj.learn_motor_speed = False
         if calibrate:
-            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0}))
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0}))
         bed.heights[1:] = [bed.heights[0] + 0.2, bed.heights[0] - 0.15]
         gcode.scripts = []
         obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"ONE_BY_ONE": 1}))
@@ -180,13 +180,13 @@ class CalibrationTest(unittest.TestCase):
     def test_levels_first_by_default(self):
         motors = uneven()
         obj, bed, gcode, configfile, probe = make_sim([0., 0.2, -0.1], motors)
-        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd())
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0}))
         self.assert_matches(obj, motors)
 
     def test_single_screw(self):
         motors = uneven()
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], motors)
-        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0, "SCREW": 2}))
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0, "SCREW": 2}))
         self.assertEqual(sorted(set(single_probes(gcode))), ["probed 2"])
         self.assertAlmostEqual(obj.motors[1].seconds_per_turn[CW], 4.2, delta=0.05)
         self.assertEqual(obj.motors[0].seconds_per_turn[CW], 3.)
@@ -194,7 +194,7 @@ class CalibrationTest(unittest.TestCase):
     def test_continuous_watches_with_the_probe(self):
         motors = uneven()
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], motors, continuous=True)
-        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0, "CONTINUOUS": 1}))
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0, "CONTINUOUS": 1}))
         self.assertEqual(single_probes(gcode), [])
         self.assertEqual(len(probe.sessions), 3)
         self.assertTrue(all(s.ended for s in probe.sessions))
@@ -205,7 +205,7 @@ class CalibrationTest(unittest.TestCase):
         motors.seconds_per_turn[1] = {CW: 1e9, CCW: 3.}
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], motors)
         with self.assertRaises(CommandError) as ctx:
-            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0}))
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0}))
         self.assertIn("Screw 2 didn't move", str(ctx.exception))
         self.assertIn("clockwise", str(ctx.exception))
         self.assertEqual(obj.last_board.writes[-1], "0")
@@ -216,23 +216,23 @@ class CalibrationTest(unittest.TestCase):
         motors.backlash[0] = 0.3
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], motors)
         with self.assertRaises(CommandError) as ctx:
-            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0}))
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0}))
         self.assertIn("bigger TURNS", str(ctx.exception))
         # A bigger move gets past it
-        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0, "TURNS": 0.4}))
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0, "TURNS": 0.4}))
         self.assertAlmostEqual(obj.motors[0].backlash, 0.3, delta=0.01)
 
     def test_needs_screw_thread_or_an_uneven_bed(self):
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], uneven())
         del obj.printer.objects["screws_tilt_adjust"].thread
         with self.assertRaises(CommandError) as ctx:
-            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0}))
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0}))
         self.assertIn("LEVEL=0", str(ctx.exception))
 
     def test_unknown_screw_is_an_error(self):
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], uneven())
         with self.assertRaises(CommandError) as ctx:
-            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0, "SCREW": 5}))
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0, "SCREW": 5}))
         self.assertIn("only 3 screws", str(ctx.exception))
 
     def test_resets_learned_speeds(self):
@@ -241,7 +241,7 @@ class CalibrationTest(unittest.TestCase):
             [0., 0., 0.], motors, save_variables=True)
         sv = obj.printer.objects["save_variables"]
         sv.variables["staa_motor2_cw_seconds_per_turn"] = 9.
-        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0}))
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0}))
         self.assertAlmostEqual(sv.variables["staa_motor2_cw_seconds_per_turn"], 4.2, delta=0.05)
 
 
@@ -279,7 +279,7 @@ class MotorModelTest(unittest.TestCase):
     def test_manual_turns_use_calibration_and_backlash(self):
         motors = uneven()
         obj, bed, gcode, configfile, probe = make_sim([0., 0., 0.], motors)
-        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"LEVEL": 0}))
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE(FakeGcmd({"TEST": 0, "LEVEL": 0}))
         for distance in (0.5, -0.3, -0.2, 0.4):
             before = bed.heights[1]
             obj.cmd_SCREWS_TILT_ADJUST_MANUAL(FakeGcmd({"SCREW": 2, "DISTANCE": distance}))
