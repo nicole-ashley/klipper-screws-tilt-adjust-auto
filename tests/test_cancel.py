@@ -119,6 +119,16 @@ class CancelTest(TestBase):
                 obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd())
             self.assertEqual(self.gcode.queued, [])
 
+    def test_print_cancel_stops_the_run_then_still_runs(self):
+        # Mainsail's and Fluidd's Cancel button sends CANCEL_PRINT, eg for a
+        # run started from a print's start G-code
+        obj = self.make([OFF, LEVEL], cancel_at=61.0, script="CANCEL_PRINT")
+        with self.assertRaises(CommandError):
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd())
+        self.assertEqual(self.gcode.queued, ["CANCEL_PRINT"])
+        self.assertLessEqual(self.reactor.now, 61.0 + staa.CANCEL_CHECK_INTERVAL)
+        self.assert_motors_stopped()
+
     def test_other_commands_go_through_during_a_run(self):
         obj = self.make([OFF, LEVEL], cancel_at=61.0, script="M117 hello")
         obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd())

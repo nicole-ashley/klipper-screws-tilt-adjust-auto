@@ -99,6 +99,7 @@ Press **Cancel** in the dialog, or send `CANCEL_LEVEL_BED_SCREWS` or `SCREWS_TIL
 - A motor that's turning stops within a tenth of a second, and the connection to the board is closed.
 - A probe move that's already under way (a measurement, or `G28`) finishes first, then the run stops before turning anything.
 - A wait for heaters stops straight away. The heaters are left as they are.
+- Cancelling a print does the same, for a run started from a print's start G-code: Mainsail's and Fluidd's Cancel button, or `CANCEL_PRINT`. The run stops, then the print cancel goes ahead as usual.
 - Nothing more is measured or homed. If any screw was turned, it says so: home Z (`G28 Z`) before printing, since the bed has moved. Learned motor speeds are kept, and a cancelled calibration saves nothing.
 
 The run ends with a "Cancelled" error, so a macro that started it stops too. A cancel from inside another macro or a print file waits its turn like any other command, so it can't stop a run.

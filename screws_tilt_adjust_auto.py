@@ -17,6 +17,10 @@ CANCEL_CHECK_INTERVAL = 0.1
 # Commands that cancel a run. Klipper runs one G-code command at a time, so
 # these are caught as they arrive rather than queueing behind the run.
 CANCEL_COMMANDS = ("SCREWS_TILT_ADJUST_AUTO_CANCEL", "CANCEL_LEVEL_BED_SCREWS")
+# Cancelling a print (Mainsail's and Fluidd's Cancel button, and CANCEL_PRINT
+# from the console) also stops a run, for one started from a print's start
+# G-code. The print cancel itself still runs once the run has stopped.
+PRINT_CANCEL_COMMANDS = ("CANCEL_PRINT",)
 
 # How far each of Klipper's screw_thread options moves per turn, in mm, and
 # whether a clockwise turn raises the bed (matches screws_tilt_adjust.py)
@@ -143,15 +147,21 @@ class ScrewsTiltAdjustAuto:
         if run_script is None:
             return
         def run_script_or_cancel(script):
-            if self.running and self._is_cancel_command(script):
-                self._request_cancel()
-                return
+            if self.running:
+                command = self._single_command(script)
+                if command in CANCEL_COMMANDS:
+                    self._request_cancel()
+                    return
+                if command in PRINT_CANCEL_COMMANDS:
+                    self._request_cancel()
             return run_script(script)
         self.gcode.run_script = run_script_or_cancel
 
-    def _is_cancel_command(self, script):
+    def _single_command(self, script):
+        # The command, in capitals, if the script is just one command with no
+        # parameters, otherwise None
         words = script.split()
-        return len(words) == 1 and words[0].upper() in CANCEL_COMMANDS
+        return words[0].upper() if len(words) == 1 else None
 
     def _request_cancel(self):
         if not self.cancel_requested:
