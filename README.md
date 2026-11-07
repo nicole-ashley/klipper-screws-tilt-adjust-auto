@@ -12,7 +12,7 @@ On your Klipper computer's terminal, run these commands as the user Klipper runs
 git clone https://github.com/nicole-ashley/klipper-screws-tilt-adjust-auto ~/screws-tilt-adjust-auto
 ~/screws-tilt-adjust-auto/install.sh
 ```
-The install script links the extra into `~/klipper/klippy/extras`, tells Klipper's git checkout to ignore the link so Klipper updates aren't affected, and restarts Klipper. If Klipper isn't in `~/klipper`, set `KLIPPER_PATH` first, for example `KLIPPER_PATH=~/my-klipper ~/screws-tilt-adjust-auto/install.sh`. You only need to run it once: updates to this repo are picked up through the link. To remove it, run `~/screws-tilt-adjust-auto/install.sh --uninstall`.
+The install script links the extra into `~/klipper/klippy/extras` and its macros file into `~/printer_data/config`, tells Klipper's git checkout to ignore the extra's link so Klipper updates aren't affected, and restarts Klipper. If Klipper isn't in `~/klipper`, set `KLIPPER_PATH` first, for example `KLIPPER_PATH=~/my-klipper ~/screws-tilt-adjust-auto/install.sh`. If `printer.cfg` isn't in `~/printer_data/config`, set `KLIPPER_CONFIG_PATH` the same way. You only need to run it once: updates to this repo are picked up through the link. To remove it, run `~/screws-tilt-adjust-auto/install.sh --uninstall`.
 
 Then add a section for your dev board to `printer.cfg`, alongside your existing `[screws_tilt_adjust]` section:
 ```ini
@@ -20,6 +20,12 @@ Then add a section for your dev board to `printer.cfg`, alongside your existing 
 serial_device: /dev/serial/by-id/usb-your-board-here
 serial_baud: 115200
 ```
+
+To get a "Level bed screws" button in Mainsail, Fluidd and KlipperScreen, also add this line to `printer.cfg`:
+```ini
+[include screws_tilt_adjust_auto.cfg]
+```
+The button needs a `[respond]` section, which most configs already have. If yours doesn't, add an empty `[respond]` line too. Don't edit the included file, as updates replace it. To customise it, copy it under another name and include that instead.
 
 And for automatic updates, add this section to your `moonraker.conf`:
 ```ini
@@ -32,6 +38,12 @@ managed_services: klipper
 ```
 
 ## Usage
+- `LEVEL_BED_SCREWS` opens a dialog in Mainsail, Fluidd and KlipperScreen, and is listed with your other macros. It shows which heaters are on, then offers:
+  - **Level**: the standard mode.
+  - **One screw at a time**: `ONE_BY_ONE=1`.
+  - **Continuous (eddy probe)**: `CONTINUOUS=1`, only shown when you have a `[probe_eddy_current]` probe.
+
+  Every option runs with `WAIT_FOR_HEATERS=1`, so if the heaters are warming up it levels now and again at temperature. With no heaters on, or all at temperature, it levels once. Needs the `[include]` line above.
 - `SCREWS_TILT_ADJUST_AUTO` measures the bed and turns the screws until it is level, then homes Z if any screw was moved.
 - `SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 [HEATERS=heater_bed,extruder]` levels while the heaters warm up, then again once they're at temperature to cater for heat flex:
   1. If the heaters are already at their targets, it levels once and stops.
