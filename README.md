@@ -37,7 +37,19 @@ managed_services: klipper
   3. Go back to step 1, until a full measurement shows the bed is level.
 
   How far to turn per millimetre is worked out from Klipper's own full measurement, so it follows whatever `screw_thread` you've set. It can be combined with `WAIT_FOR_HEATERS=1`. If a screw can't be levelled within `maximum_attempts` turns, the run stops with an error.
+- `SCREWS_TILT_ADJUST_AUTO CONTINUOUS=1` is for eddy current probes, which can read the bed without touching it. It works like `ONE_BY_ONE=1`, but instead of probing a screw again after every turn, it parks the probe over the screw and keeps it there, reading the bed while the motor turns back and forth until that screw is level:
+  1. Measure every screw.
+  2. For each screw that needs moving: move the probe over it at `scan_height`, then turn the screw and read it again, over and over without moving the toolhead, until it's level.
+  3. Go back to step 1, until a full measurement shows the bed is level.
+
+  Readings use Klipper's own `METHOD=scan` probing, so drift compensation and the probe's calibrated range all apply. Only how the reading changes is used, so it doesn't matter if it's slightly offset from the full measurement. It needs a `[probe_eddy_current]` probe and a Klipper version from mid 2024 or later. It can be combined with `WAIT_FOR_HEATERS=1`.
 - `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns>` turns one screw motor by the given number of turns (negative for counter-clockwise).
+
+Optional settings for continuous mode, in the `[screws_tilt_adjust_auto]` section:
+```ini
+scan_height: 2          # toolhead Z to read the bed from, within the probe's calibrated range
+scan_sample_time: 0.5   # seconds of readings averaged for each check
+```
 
 Set your heater targets first (for example with `M140 S60` and `M104 S200`), then run the command.
 

@@ -3,6 +3,7 @@
 # Copyright (C) 2024  Nicole Ashley <nicole@ashley.kiwi>
 #
 # This file may be distributed under the terms of the MIT license.
+import contextlib
 import re
 import serial
 
@@ -17,8 +18,11 @@ class ScrewsTiltAdjustAuto:
         self.serial_baud = config.get("serial_baud")
         self.full_turn_time_in_seconds = config.getfloat("full_turn_time_in_seconds", 3)
         self.maximum_attempts = config.getint("maximum_attempts", 10)
+        self.scan_height = config.getfloat("scan_height", 2.)
+        self.scan_sample_time = config.getfloat("scan_sample_time", 0.5)
         self.board = None
         self.one_by_one = False
+        self.continuous = False
         self.heights = []
 
         self.printer = config.get_printer()
@@ -95,7 +99,14 @@ class ScrewsTiltAdjustAuto:
 
     cmd_SCREWS_TILT_ADJUST_AUTO_help = "Tool to automatically adjust bed level screws"
     def cmd_SCREWS_TILT_ADJUST_AUTO(self, gcmd):
-        self.one_by_one = bool(gcmd.get_int("ONE_BY_ONE", 0, minval=0, maxval=1))
+        self.continuous = bool(gcmd.get_int("CONTINUOUS", 0, minval=0, maxval=1))
+        # Continuous mode settles one screw at a time too, it just watches
+        # the screw with the probe instead of probing it again each time
+        self.one_by_one = self.continuous or \
+            bool(gcmd.get_int("ONE_BY_ONE", 0, minval=0, maxval=1))
+        if self.continuous:
+            # Fail before homing or measuring if the probe can't do this
+            self._lookup_scanning_probe()
         if gcmd.get_int("WAIT_FOR_HEATERS", 0, minval=0, maxval=1):
             self._adjust_while_heating(gcmd)
         else:
@@ -111,7 +122,12 @@ class ScrewsTiltAdjustAuto:
         # Returns True once the bed is level, or False if it ran out of
         # attempts. When heaters are given, also records whether they were
         # at target just before the last measurement was taken.
-        self.gcode.respond_info("STAA: Starting" + (" (one by one)" if self.one_by_one else ""))
+        mode = ""
+        if self.continuous:
+            mode = " (continuous)"
+        elif self.one_by_one:
+            mode = " (one by one)"
+        self.gcode.respond_info("STAA: Starting" + mode)
         self.heaters_at_target_before_last_measurement = False
 
         self._home_if_necessary()
@@ -146,7 +162,7 @@ class ScrewsTiltAdjustAuto:
         return level
 
     def _adjust_one_by_one(self, movements):
-        # Settle each screw in turn, probing only that screw between turns
+        # Settle each screw in turn, measuring only that screw between turns
         # and comparing it to the height the full measurement says it should
         # be at (that of a screw that doesn't need moving). The caller does a
         # full measurement again afterwards, since moving one screw can
@@ -160,18 +176,94 @@ class ScrewsTiltAdjustAuto:
         for screw, movement in enumerate(movements):
             if movement == 0:
                 continue
-            for attempt in range(self.maximum_attempts):
-                self.gcode.respond_info("STAA: Screw %d movement: %s" % (screw + 1, movement))
-                self._turn_motors(self._single_motor(screw, movement, len(movements)))
-                movement = self._height_to_turns(target - self._measure_screw(screw))
-                if movement == 0:
-                    break
-            else:
-                self.gcode.respond_info("STAA: Unable to level screw %d after %s attempts" % (
-                    screw + 1, self.maximum_attempts))
-                return False
+            with self._screw_reader(screw) as read:
+                for attempt in range(self.maximum_attempts):
+                    self.gcode.respond_info("STAA: Screw %d movement: %s" % (screw + 1, movement))
+                    self._turn_motors(self._single_motor(screw, movement, len(movements)))
+                    movement = self._height_to_turns(target - read())
+                    if movement == 0:
+                        break
+                else:
+                    self.gcode.respond_info("STAA: Unable to level screw %d after %s attempts" % (
+                        screw + 1, self.maximum_attempts))
+                    return False
             self.gcode.respond_info("STAA: Screw %d level" % (screw + 1,))
         return True
+
+    @contextlib.contextmanager
+    def _screw_reader(self, screw):
+        # Yields a function that returns the screw's current height, on the
+        # same scale as the full measurement
+        if not self.continuous:
+            yield lambda: self._measure_screw(screw)
+            return
+        with self._scan_screw(screw) as scan:
+            # The probe's own reading can be offset from what the full
+            # measurement found, so only trust how it changes. The screw
+            # hasn't moved since the full measurement, so this first
+            # reading is the height that measurement found.
+            offset = self.heights[screw] - scan()
+            yield lambda: scan() + offset
+
+    @contextlib.contextmanager
+    def _scan_screw(self, screw):
+        # Park the probe over the screw and keep it there, reading the bed
+        # with Klipper's own METHOD=scan probing (which samples where the
+        # toolhead is rather than moving down to the bed) while the motor
+        # turns. Yields a function that takes a fresh reading.
+        probe = self._lookup_scanning_probe()
+        sta = self._lookup_screws_tilt_adjust()
+        coord = sta.screws[screw][0]
+        self.gcode.respond_info("STAA: Watching screw %d with the probe" % (screw + 1,))
+        self._move_to_scan(probe, sta, coord)
+        gcmd = self.gcode.create_gcode_command("PROBE", "PROBE", {
+            "METHOD": "scan", "SAMPLE_TIME": str(self.scan_sample_time)})
+        session = probe.start_probe_session(gcmd)
+        def scan():
+            session.run_probe(gcmd)
+            return self._probe_result_z(session.pull_probed_results()[-1])
+        try:
+            yield scan
+        finally:
+            session.end_probe_session()
+            self._lift_after_scan(probe, sta)
+
+    def _move_to_scan(self, probe, sta, coord):
+        # Same moves SCREWS_TILT_CALCULATE makes: up to its travel height,
+        # across to the screw, then down to where the probe can read the bed
+        toolhead = self.printer.lookup_object('toolhead')
+        lift_speed = probe.get_probe_params()['lift_speed']
+        toolhead.manual_move([None, None, self._travel_height(sta)], lift_speed)
+        toolhead.manual_move([coord[0], coord[1], None], getattr(sta.probe_helper, "speed", 50.))
+        toolhead.manual_move([None, None, self.scan_height], lift_speed)
+        toolhead.wait_moves()
+
+    def _lift_after_scan(self, probe, sta):
+        toolhead = self.printer.lookup_object('toolhead')
+        lift_speed = probe.get_probe_params()['lift_speed']
+        toolhead.manual_move([None, None, self._travel_height(sta)], lift_speed)
+
+    def _travel_height(self, sta):
+        helper = sta.probe_helper
+        z = getattr(helper, "horizontal_move_z",
+                    getattr(helper, "default_horizontal_move_z", 5.))
+        return max(z, self.scan_height)
+
+    def _probe_result_z(self, result):
+        # Newer Klipper returns a ProbeResult, older versions a plain list
+        z = getattr(result, "bed_z", None)
+        return result[2] if z is None else z
+
+    def _lookup_scanning_probe(self):
+        # METHOD=scan is only honoured by Klipper's eddy current probes. Any
+        # other probe would treat it as a normal probe and move down to the
+        # bed, so don't let continuous mode use one.
+        probe = self.printer.lookup_object('probe', None)
+        eddy_probes = [obj for name, obj in self.printer.lookup_objects('probe_eddy_current')]
+        if probe is None or not any(probe is obj for obj in eddy_probes):
+            raise self.gcode.error(
+                "STAA: Continuous mode needs a [probe_eddy_current] probe. Use ONE_BY_ONE=1 for other probes.")
+        return probe
 
     def _single_motor(self, screw, movement, count):
         movements = [0] * count
