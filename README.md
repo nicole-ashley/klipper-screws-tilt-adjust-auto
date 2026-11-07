@@ -43,7 +43,8 @@ managed_services: klipper
   - **One screw at a time**: `ONE_BY_ONE=1`.
   - **Continuous (eddy probe)**: `CONTINUOUS=1`, only shown when you have a `[probe_eddy_current]` probe.
 
-  Every option runs with `WAIT_FOR_HEATERS=1`, so if the heaters are warming up it levels now and again at temperature. With no heaters on, or all at temperature, it levels once. Needs the `[include]` line above.
+  Every option runs with `WAIT_FOR_HEATERS=1`, so if the heaters are warming up it levels now and again at temperature. With no heaters on, or all at temperature, it levels once. While it runs, a dialog with a **Cancel** button stays open. Needs the `[include]` line above.
+- `CANCEL_LEVEL_BED_SCREWS` (or `SCREWS_TILT_ADJUST_AUTO_CANCEL`) stops a running levelling, calibration or manual turn. See [Cancelling a run](#cancelling-a-run).
 - `SCREWS_TILT_ADJUST_AUTO` measures the bed and turns the screws until it is level, then homes Z if any screw was moved.
 - `SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 [HEATERS=heater_bed,extruder]` levels while the heaters warm up, then again once they're at temperature to cater for heat flex:
   1. If the heaters are already at their targets, it levels once and stops.
@@ -65,6 +66,7 @@ managed_services: klipper
 
   Readings use Klipper's own `METHOD=scan` probing, so drift compensation and the probe's calibrated range all apply. Only how the reading changes is used, so it doesn't matter if it's slightly offset from the full measurement. It needs a `[probe_eddy_current]` probe and a Klipper version from mid 2024 or later. It can be combined with `WAIT_FOR_HEATERS=1`.
 - `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns> [FORCE=1]` turns one screw motor by the given number of turns (negative for counter-clockwise). Turns bigger than `max_turns_per_move` are refused unless you add `FORCE=1`.
+- Add `DIALOG=1` to `SCREWS_TILT_ADJUST_AUTO`, `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` or `SCREWS_TILT_ADJUST_MANUAL` to show a dialog with a Cancel button while it runs, as the `LEVEL_BED_SCREWS` dialog does.
 - `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` measures how fast each motor turns each way, and its backlash, so screws get level in fewer tries. See [Motor calibration and backlash](#motor-calibration-and-backlash).
 
 Optional settings for continuous mode, in the `[screws_tilt_adjust_auto]` section:
@@ -91,6 +93,15 @@ max_turns_per_run: 3       # most any screw may turn in one run, in turns
 max_deviation: 2           # mm, passed to SCREWS_TILT_CALCULATE
 reading_tolerance: 0.02    # mm of probe noise allowed before a reading counts as getting worse
 ```
+
+### Cancelling a run
+Press **Cancel** in the dialog, or send `CANCEL_LEVEL_BED_SCREWS` or `SCREWS_TILT_ADJUST_AUTO_CANCEL` from the console or a macro button. Klipper normally runs one command at a time, so a cancel would wait until the run had finished. Instead these are caught as soon as they arrive from Mainsail, Fluidd, KlipperScreen or anything else using Moonraker, and the run stops:
+- A motor that's turning stops within a tenth of a second, and the connection to the board is closed.
+- A probe move that's already under way (a measurement, or `G28`) finishes first, then the run stops before turning anything.
+- A wait for heaters stops straight away. The heaters are left as they are.
+- Nothing more is measured or homed. If any screw was turned, it says so: home Z (`G28 Z`) before printing, since the bed has moved. Learned motor speeds are kept, and a cancelled calibration saves nothing.
+
+The run ends with a "Cancelled" error, so a macro that started it stops too. A cancel from inside another macro or a print file waits its turn like any other command, so it can't stop a run.
 
 ### Motor calibration and backlash
 Each motor runs at its own speed, and at a different speed each way, because one way works against the bed springs. Motors also take a moment to get going, and there's some slack to take up when a screw changes direction (backlash). Without calibration every motor is timed with `full_turn_time_in_seconds` and none of this is allowed for, so screws take more tries to get level, and small turns might not move at all.

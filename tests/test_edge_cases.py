@@ -295,7 +295,8 @@ class ConfigTest(unittest.TestCase):
         self.assertIsInstance(obj, staa.ScrewsTiltAdjustAuto)
         self.assertEqual(obj.serial_device, "/dev/ttyUSB0")
         self.assertEqual(registered, ["SCREWS_TILT_ADJUST_AUTO", "SCREWS_TILT_ADJUST_MANUAL",
-                                      "SCREWS_TILT_ADJUST_AUTO_CALIBRATE"])
+                                      "SCREWS_TILT_ADJUST_AUTO_CALIBRATE",
+                                      "SCREWS_TILT_ADJUST_AUTO_CANCEL"])
         self.assertEqual(gcode.output_handler, obj._handle_output)
 
 

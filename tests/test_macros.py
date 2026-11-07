@@ -117,16 +117,28 @@ class TestLevelBedScrewsRun(unittest.TestCase):
         self.assertEqual(self.run_mode()[0], 'RESPOND TYPE=command MSG="action:prompt_end"')
 
     def test_modes(self):
-        self.assertEqual(self.run_mode()[-1], "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1")
-        self.assertEqual(self.run_mode("standard")[-1], "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1")
+        self.assertEqual(self.run_mode()[-1], "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 DIALOG=1")
+        self.assertEqual(self.run_mode("standard")[-1],
+                         "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 DIALOG=1")
         self.assertEqual(self.run_mode("one_by_one")[-1],
-                         "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 ONE_BY_ONE=1")
+                         "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 ONE_BY_ONE=1 DIALOG=1")
         self.assertEqual(self.run_mode("continuous")[-1],
-                         "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 CONTINUOUS=1")
+                         "SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 CONTINUOUS=1 DIALOG=1")
 
     def test_cancel_closes_dialog(self):
         lines = render(self.macros["_LEVEL_BED_SCREWS_CLOSE"], printer_state())
         self.assertEqual(lines, ['RESPOND TYPE=command MSG="action:prompt_end"'])
+
+    def test_cancel_macro_matches_what_klipper_catches(self):
+        # The extra catches this macro by name while a run is going
+        import sys
+        sys.modules.setdefault("serial", type(sys)("serial"))
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        import screws_tilt_adjust_auto as staa
+        self.assertIn("CANCEL_LEVEL_BED_SCREWS", self.macros)
+        self.assertIn("CANCEL_LEVEL_BED_SCREWS", staa.CANCEL_COMMANDS)
+        lines = render(self.macros["CANCEL_LEVEL_BED_SCREWS"], printer_state())
+        self.assertEqual(lines, ["SCREWS_TILT_ADJUST_AUTO_CANCEL"])
 
 
 if __name__ == "__main__":
