@@ -65,7 +65,11 @@ class ScrewsTiltAdjustAuto:
         deadline = self.reactor.monotonic() + HANDSHAKE_TIMEOUT
         while not self.board.read(1):
             if self.reactor.monotonic() >= deadline:
-                break
+                self.board.close()
+                self.board = None
+                raise self.gcode.error(
+                    "STAA: No response from the board on %s after %d seconds" % (
+                        self.serial_device, HANDSHAKE_TIMEOUT))
             self._pause(0.05)
 
     def _disconnect_from_board(self):
@@ -86,6 +90,9 @@ class ScrewsTiltAdjustAuto:
              raise gcmd.error(
                     "Error on '%s': SCREW and DISTANCE must be provided" % (
                         gcmd.get_commandline(),))
+        if screw < 1:
+            raise gcmd.error(
+                "Error on '%s': SCREW must be 1 or more" % (gcmd.get_commandline(),))
 
         directions = [0] * screw
         directions[screw - 1] = distance
@@ -429,6 +436,10 @@ class ScrewsTiltAdjustAuto:
         return turns * direction
 
     def _calculate_motor_movements(self):
+        if not self.measurements:
+            # Without this the bed would look level and nothing would move
+            raise self.gcode.error(
+                "STAA: Couldn't read any screw adjustments from SCREWS_TILT_CALCULATE")
         movements = [self._measurement_to_turns(m) for m in self.measurements]
 
         base_offset = 0
