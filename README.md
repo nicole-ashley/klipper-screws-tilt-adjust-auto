@@ -7,13 +7,22 @@ _Automatically adjust your bed screws with a development board and motors._
 Open `screws-tilt-adjust-auto.ino` in Arduino IDE, and use the Library Manager to install [Adafruit Motor Shield library by Adafruit](https://github.com/adafruit/Adafruit-Motor-Shield-library) (not V2). Connect your board, compile and upload the code.
 
 ### Install the Klipper extra
-On your Klipper computer's terminal, run these commands:
+On your Klipper computer's terminal, run these commands as the user Klipper runs as (usually `pi`):
 ```sh
 git clone https://github.com/nicole-ashley/klipper-screws-tilt-adjust-auto ~/screws-tilt-adjust-auto
-ln -s ~/klipper/klippy/extras/screws-tilt-adjust-auto.py ~/screws-tilt-adjust-auto/screws-tilt-adjust-auto.py
+~/screws-tilt-adjust-auto/install.sh
 ```
+The install script links the extra into `~/klipper/klippy/extras`, tells Klipper's git checkout to ignore the link so Klipper updates aren't affected, and restarts Klipper. If Klipper isn't in `~/klipper`, set `KLIPPER_PATH` first, for example `KLIPPER_PATH=~/my-klipper ~/screws-tilt-adjust-auto/install.sh`. You only need to run it once: updates to this repo are picked up through the link. To remove it, run `~/screws-tilt-adjust-auto/install.sh --uninstall`.
+
+Then add a section for your dev board to `printer.cfg`, alongside your existing `[screws_tilt_adjust]` section:
+```ini
+[screws_tilt_adjust_auto]
+serial_device: /dev/serial/by-id/usb-your-board-here
+serial_baud: 115200
+```
+
 And for automatic updates, add this section to your `moonraker.conf`:
-```yml
+```ini
 [update_manager screws-tilt-adjust-auto]
 type: git_repo
 path: ~/screws-tilt-adjust-auto
