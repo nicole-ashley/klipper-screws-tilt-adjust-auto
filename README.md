@@ -14,7 +14,7 @@ On your Klipper computer's terminal, run these commands as the user Klipper runs
 git clone https://github.com/nicole-ashley/klipper-screws-tilt-adjust-auto ~/screws-tilt-adjust-auto
 ~/screws-tilt-adjust-auto/install.sh
 ```
-The install script links the extra into `~/klipper/klippy/extras`, tells Klipper's git checkout to ignore the link so Klipper updates aren't affected, and restarts Klipper. If Klipper isn't in `~/klipper`, set `KLIPPER_PATH` first, for example `KLIPPER_PATH=~/my-klipper ~/screws-tilt-adjust-auto/install.sh`. You only need to run it once: updates to this repo are picked up through the link. To remove it, run `~/screws-tilt-adjust-auto/install.sh --uninstall`.
+The install script links the extra into `~/klipper/klippy/extras` and its macros file into `~/printer_data/config`, tells Klipper's git checkout to ignore the extra's link so Klipper updates aren't affected, and restarts Klipper. If Klipper isn't in `~/klipper`, set `KLIPPER_PATH` first, for example `KLIPPER_PATH=~/my-klipper ~/screws-tilt-adjust-auto/install.sh`. If `printer.cfg` isn't in `~/printer_data/config`, set `KLIPPER_CONFIG_PATH` the same way. You only need to run it once: updates to this repo are picked up through the link. To remove it, run `~/screws-tilt-adjust-auto/install.sh --uninstall`.
 
 Then add a section for your dev board to `printer.cfg`, alongside your existing `[screws_tilt_adjust]` section:
 ```ini
@@ -22,6 +22,12 @@ Then add a section for your dev board to `printer.cfg`, alongside your existing 
 serial_device: /dev/serial/by-id/usb-your-board-here
 serial_baud: 115200
 ```
+
+To get a "Level bed screws" button in Mainsail, Fluidd and KlipperScreen, also add this line to `printer.cfg`:
+```ini
+[include screws_tilt_adjust_auto.cfg]
+```
+The button needs a `[respond]` section, which most configs already have. If yours doesn't, add an empty `[respond]` line too. Don't edit the included file, as updates replace it. To customise it, copy it under another name and include that instead.
 
 And for automatic updates, add this section to your `moonraker.conf`:
 ```ini
@@ -34,6 +40,12 @@ managed_services: klipper
 ```
 
 ## Usage
+- `LEVEL_BED_SCREWS` opens a dialog in Mainsail, Fluidd and KlipperScreen, and is listed with your other macros. It shows which heaters are on, then offers:
+  - **Level**: the standard mode.
+  - **One screw at a time**: `ONE_BY_ONE=1`.
+  - **Continuous (eddy probe)**: `CONTINUOUS=1`, only shown when you have a `[probe_eddy_current]` probe.
+
+  Every option runs with `WAIT_FOR_HEATERS=1`, so if the heaters are warming up it levels now and again at temperature. With no heaters on, or all at temperature, it levels once. Needs the `[include]` line above.
 - `SCREWS_TILT_ADJUST_AUTO` measures the bed and turns the screws until it is level, then homes Z if any screw was moved.
 - `SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 [HEATERS=heater_bed,extruder]` levels while the heaters warm up, then again once they're at temperature to cater for heat flex:
   1. If the heaters are already at their targets, it levels once and stops.
@@ -55,6 +67,7 @@ managed_services: klipper
 
   Readings use Klipper's own `METHOD=scan` probing, so drift compensation and the probe's calibrated range all apply. Only how the reading changes is used, so it doesn't matter if it's slightly offset from the full measurement. It needs a `[probe_eddy_current]` probe and a Klipper version from mid 2024 or later. It can be combined with `WAIT_FOR_HEATERS=1`.
 - `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns> [FORCE=1]` turns one screw motor by the given number of turns (negative for counter-clockwise). Turns bigger than `max_turns_per_move` are refused unless you add `FORCE=1`.
+- `SCREWS_TILT_ADJUST_AUTO_CALIBRATE` measures how fast each motor turns each way, and its backlash, so screws get level in fewer tries. See [Motor calibration and backlash](#motor-calibration-and-backlash).
 
 Optional settings for continuous mode, in the `[screws_tilt_adjust_auto]` section:
 ```ini
@@ -79,6 +92,38 @@ max_turns_per_move: 1      # biggest single turn, in turns
 max_turns_per_run: 3       # most any screw may turn in one run, in turns
 max_deviation: 2           # mm, passed to SCREWS_TILT_CALCULATE
 reading_tolerance: 0.02    # mm of probe noise allowed before a reading counts as getting worse
+```
+
+### Motor calibration and backlash
+Each motor runs at its own speed, and at a different speed each way, because one way works against the bed springs. Motors also take a moment to get going, and there's some slack to take up when a screw changes direction (backlash). Without calibration every motor is timed with `full_turn_time_in_seconds` and none of this is allowed for, so screws take more tries to get level, and small turns might not move at all.
+
+`SCREWS_TILT_ADJUST_AUTO_CALIBRATE` measures all of this for each motor:
+1. Levels the bed first, so the screws are calibrated where they normally sit. Motors run slower the tighter a screw is, so this matters. Add `LEVEL=0` to skip it.
+2. For each screw, rocks it back and forth around where it sits and measures it after every move: a clockwise move to take up the slack, then two more clockwise moves of different lengths, then the same counter-clockwise. The two moves in a row give the speed and spin-up time for that direction. How far the first move after changing direction falls short gives the backlash.
+3. Puts the screw back where it started, using what it just measured.
+4. Shows the results. Run `SAVE_CONFIG` to keep them, as with Klipper's own calibration commands.
+
+Options: `SCREW=<n>` calibrates just one screw. `CONTINUOUS=1` watches the screw with an eddy current probe instead of probing it after every move, which is quicker and more precise. `TURNS=<turns>` sets the size of the shortest move (default `calibration_turns`); use a bigger one if it says the backlash is more than the calibration moves. `CYCLES=<n>` sets how many times it goes back and forth (default `calibration_cycles`).
+
+It needs to know how far a turn moves the bed. Klipper versions that say which `screw_thread` is set in `[screws_tilt_adjust]` give that directly. With older versions, calibrate with `LEVEL=0` while the bed is slightly out of level.
+
+The values it saves, which you can also set by hand (the defaults are `full_turn_time_in_seconds`, no spin-up and no backlash):
+```ini
+motor1_cw_seconds_per_turn: 2.8
+motor1_ccw_seconds_per_turn: 3.4
+motor1_cw_spin_up_time: 0.1     # seconds before the motor starts turning; negative if it coasts on after stopping
+motor1_ccw_spin_up_time: 0.15
+motor1_backlash: 0.05           # turns of slack taken up when the motor changes direction
+```
+Keep these in `printer.cfg` itself, not in a file it includes, so `SAVE_CONFIG` can update them.
+
+Backlash is added to the first turn after a motor changes direction. This needs to know which way the motor last turned, which is only kept across Klipper restarts if you have a `[save_variables]` section.
+
+**Learning.** In `ONE_BY_ONE` and `CONTINUOUS` modes, every turn is followed by a reading, so it compares how far the screw actually moved with how far it was asked to, and moves that direction's speed part of the way toward what the turn suggests. That follows the motors as screws tighten or loosen over time. Turns too small to tell from the probe's noise, and readings that suggest a speed more than twice or less than half the current one, are skipped. With a `[save_variables]` section, learned speeds are kept for the next run, and are used in place of the ones in `printer.cfg`. Running the calibration again starts learning over from the new values. Default mode turns every screw together, so it doesn't learn.
+```ini
+learn_motor_speed: True     # set to False to only use calibrated values
+calibration_turns: 0.125    # shortest calibration move, in turns
+calibration_cycles: 2       # times calibration goes back and forth
 ```
 
 ## Running the tests

@@ -5,7 +5,8 @@
 #   ./install.sh               install, then restart Klipper
 #   ./install.sh --uninstall   remove the link, then restart Klipper
 #
-# Set KLIPPER_PATH if Klipper isn't in ~/klipper.
+# Set KLIPPER_PATH if Klipper isn't in ~/klipper, and KLIPPER_CONFIG_PATH if
+# printer.cfg isn't in ~/printer_data/config.
 set -euo pipefail
 
 MODULE="screws_tilt_adjust_auto.py"
@@ -15,6 +16,9 @@ EXTRAS_DIR="$KLIPPER_PATH/klippy/extras"
 LINK="$EXTRAS_DIR/$MODULE"
 EXCLUDE_FILE="$KLIPPER_PATH/.git/info/exclude"
 EXCLUDE_ENTRY="klippy/extras/$MODULE"
+MACROS="screws_tilt_adjust_auto.cfg"
+CONFIG_PATH="${KLIPPER_CONFIG_PATH:-$HOME/printer_data/config}"
+MACROS_LINK="$CONFIG_PATH/$MACROS"
 
 if [ "$(id -u)" -eq 0 ]; then
     echo "Run this as the user Klipper runs as, not as root." >&2
@@ -47,6 +51,10 @@ if [ "${1:-}" = "--uninstall" ]; then
     if [ -f "$EXCLUDE_FILE" ]; then
         sed -i "\#^${EXCLUDE_ENTRY}\$#d" "$EXCLUDE_FILE"
     fi
+    if [ -L "$MACROS_LINK" ]; then
+        rm "$MACROS_LINK"
+        echo "Removed $MACROS_LINK. Remove [include $MACROS] from printer.cfg too."
+    fi
     restart_klipper
     exit 0
 fi
@@ -58,6 +66,19 @@ fi
 
 ln -sfn "$SRC_DIR/$MODULE" "$LINK"
 echo "Linked $LINK -> $SRC_DIR/$MODULE"
+
+# The macros file goes next to printer.cfg so it can be included by name.
+if [ -d "$CONFIG_PATH" ]; then
+    if [ -e "$MACROS_LINK" ] && [ ! -L "$MACROS_LINK" ]; then
+        echo "$MACROS_LINK already exists and isn't a link, so it was left alone." >&2
+    else
+        ln -sfn "$SRC_DIR/$MACROS" "$MACROS_LINK"
+        echo "Linked $MACROS_LINK -> $SRC_DIR/$MACROS"
+    fi
+else
+    echo "Couldn't find your config folder at $CONFIG_PATH, so the macros weren't linked." >&2
+    echo "Set KLIPPER_CONFIG_PATH to the folder with printer.cfg and run this again." >&2
+fi
 
 # Keep Klipper's own git checkout clean so its updates aren't affected.
 if [ -d "$KLIPPER_PATH/.git" ]; then

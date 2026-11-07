@@ -320,7 +320,8 @@ class ConfigTest(unittest.TestCase):
             "scan_height": 2., "scan_sample_time": 0.5}))
         self.assertIsInstance(obj, staa.ScrewsTiltAdjustAuto)
         self.assertEqual(obj.serial_device, "/dev/ttyUSB0")
-        self.assertEqual(registered, ["SCREWS_TILT_ADJUST_AUTO", "SCREWS_TILT_ADJUST_MANUAL"])
+        self.assertEqual(registered, ["SCREWS_TILT_ADJUST_AUTO", "SCREWS_TILT_ADJUST_MANUAL",
+                                      "SCREWS_TILT_ADJUST_AUTO_CALIBRATE"])
 
 
 if __name__ == "__main__":

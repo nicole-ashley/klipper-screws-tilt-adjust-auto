@@ -26,7 +26,11 @@ class FakeConfig:
         return self.values.get(name, default)
 
     def getfloat(self, name, default=None, **kwargs):
-        return float(self.values.get(name, default))
+        value = self.values.get(name, default)
+        return None if value is None else float(value)
+
+    def getboolean(self, name, default=None, **kwargs):
+        return bool(self.values.get(name, default))
 
     def getint(self, name, default=None, **kwargs):
         return int(self.values.get(name, default))
@@ -175,8 +179,10 @@ class FakePrinter:
         self.objects = objects
         self.shutdown = False
 
-    def lookup_object(self, name, default=None):
-        return self.objects.get(name, default)
+    def lookup_object(self, name, *default):
+        if default:
+            return self.objects.get(name, default[0])
+        return self.objects[name]
 
     def get_reactor(self):
         return self.reactor
