@@ -26,7 +26,11 @@ class FakeConfig:
         return self.values.get(name, default)
 
     def getfloat(self, name, default=None, **kwargs):
-        return float(self.values.get(name, default))
+        value = self.values.get(name, default)
+        return None if value is None else float(value)
+
+    def getboolean(self, name, default=None, **kwargs):
+        return bool(self.values.get(name, default))
 
     def getint(self, name, default=None, **kwargs):
         return int(self.values.get(name, default))
