@@ -7,6 +7,8 @@ _Automatically adjust your bed screws with a development board and motors._
 Open `screws-tilt-adjust-auto.ino` in Arduino IDE, and use the Library Manager to install [Adafruit Motor Shield library by Adafruit](https://github.com/adafruit/Adafruit-Motor-Shield-library) (not V2). Connect your board, compile and upload the code.
 
 ### Install the Klipper extra
+The extra reads the results Klipper keeps after each `SCREWS_TILT_CALCULATE` rather than its console output, so it needs Klipper from January 2023 or later.
+
 On your Klipper computer's terminal, run these commands as the user Klipper runs as (usually `pi`):
 ```sh
 git clone https://github.com/nicole-ashley/klipper-screws-tilt-adjust-auto ~/screws-tilt-adjust-auto

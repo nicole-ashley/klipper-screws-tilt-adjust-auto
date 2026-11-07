@@ -126,6 +126,9 @@ class FakeScrewsTiltAdjust:
         self.probe_helper = FakeProbeHelper([c for c, n in self.screws])
         self.results = {"original": True}
 
+    def get_status(self, eventtime):
+        return {"error": False, "max_deviation": 10., "results": self.results}
+
 
 class FakeGcode:
     error = CommandError
@@ -134,13 +137,9 @@ class FakeGcode:
         self.bed = bed
         self.sta = sta
         self.scripts = []
-        self.output_handler = None
 
     def register_command(self, *args, **kwargs):
         pass
-
-    def register_output_handler(self, handler):
-        self.output_handler = handler
 
     def respond_info(self, msg):
         pass
@@ -151,7 +150,7 @@ class FakeGcode:
             self._screws_tilt_calculate()
 
     def _screws_tilt_calculate(self):
-        # Probe the configured points and report like Klipper does,
+        # Probe the configured points and record results like Klipper does,
         # with the first point as the base
         assert [c for c, n in self.sta.screws] == self.sta.probe_helper.probe_points
         all_coords = [(10. * i, 10. * i) for i in range(len(self.bed.heights))]
@@ -159,17 +158,21 @@ class FakeGcode:
         self.scripts.append("probed %s" % ",".join(str(i + 1) for i in indexes))
         self.sta.results = {}
         z_base = self.bed.heights[indexes[0]]
-        self.output_handler("%s (base) : x=0, y=0, z=%.5f" % (self.sta.screws[0][1], z_base))
-        for (coord, name), index in zip(self.sta.screws[1:], indexes[1:]):
+        for i, index in enumerate(indexes):
             z = self.bed.heights[index]
+            if i == 0:
+                self.sta.results["screw1"] = {
+                    "z": z, "sign": "CW", "adjust": "00:00", "is_base": True}
+                continue
             diff = z_base - z
             adjust = 0 if abs(diff) < 0.001 else diff / PITCH
             sign = "CW" if adjust >= 0 else "CCW"
             adjust = abs(adjust)
             full_turns = math.trunc(adjust)
             minutes = round((adjust - full_turns) * 60, 0)
-            self.output_handler("%s : x=0, y=0, z=%.5f : adjust %s %02d:%02d" % (
-                name, z, sign, full_turns, minutes))
+            self.sta.results["screw%d" % (i + 1,)] = {
+                "z": z, "sign": sign, "adjust": "%02d:%02d" % (full_turns, minutes),
+                "is_base": False}
 
 
 class FakeKinematics:
@@ -298,36 +301,62 @@ class FakeHeaters:
 
 
 class TurnsPerMmTest(unittest.TestCase):
-    def learn(self, lines):
+    def learn(self, results):
         obj, bed, gcode, sta = make([0., 0., 0.])
-        obj.active = True
-        for line in lines:
-            obj._handle_output(line)
+        # As if SCREWS_TILT_CALCULATE had just left these results
+        sta.results = results
+        gcode.run_script_from_command = lambda script: None
+        obj._measure_bed_tilt()
         obj._learn_turns_per_mm()
         return obj
 
+    @staticmethod
+    def screw(z, sign, adjust, is_base=False):
+        return {"z": z, "sign": sign, "adjust": adjust, "is_base": is_base}
+
     def test_learns_cw_thread_from_measurement(self):
-        obj = self.learn([
-            "a (base) : x=0, y=0, z=1.00000",
-            "b : x=0, y=0, z=0.75000 : adjust CW 00:30",
-            "c : x=0, y=0, z=1.10000 : adjust CCW 00:12",
-        ])
+        obj = self.learn({
+            "screw1": self.screw(1., "CW", "00:00", True),
+            "screw2": self.screw(0.75, "CW", "00:30"),
+            "screw3": self.screw(1.1, "CCW", "00:12"),
+        })
         self.assertAlmostEqual(obj.turns_per_mm, 2.)
         self.assertAlmostEqual(obj._height_to_turns(0.25), 0.5)
 
     def test_learns_ccw_thread_from_measurement(self):
-        obj = self.learn([
-            "a (base) : x=0, y=0, z=1.00000",
-            "b : x=0, y=0, z=0.65000 : adjust CCW 00:30",
-            "c : x=0, y=0, z=1.00000 : adjust CW 00:00",
-        ])
+        obj = self.learn({
+            "screw1": self.screw(1., "CCW", "00:00", True),
+            "screw2": self.screw(0.65, "CCW", "00:30"),
+            "screw3": self.screw(1., "CW", "00:00"),
+        })
         self.assertAlmostEqual(obj.turns_per_mm, -1 / 0.7)
 
+    def test_base_does_not_have_to_be_the_first_screw(self):
+        # e.g. if SCREWS_TILT_CALCULATE was run with DIRECTION
+        obj = self.learn({
+            "screw1": self.screw(0.75, "CW", "00:30"),
+            "screw2": self.screw(1., "CW", "00:00", True),
+            "screw3": self.screw(1.25, "CCW", "00:30"),
+        })
+        self.assertEqual(obj.base, 1)
+        self.assertAlmostEqual(obj.turns_per_mm, 2.)
+
+    def test_results_are_read_in_screw_order(self):
+        # Ten or more screws sort by number, not alphabetically
+        results = {"screw%d" % (i + 1,): self.screw(1. - 0.05 * i, "CW", "00:%02d" % (6 * i,))
+                   for i in range(11)}
+        results["screw1"]["is_base"] = True
+        obj = self.learn(dict(reversed(list(results.items()))))
+        self.assertEqual(obj.base, 0)
+        self.assertAlmostEqual(obj.heights[10], 0.5)
+        self.assertAlmostEqual(obj.adjustments[10], 1.)
+        self.assertAlmostEqual(obj.turns_per_mm, 2.)
+
     def test_under_half_a_minute_is_level(self):
-        obj = self.learn([
-            "a (base) : x=0, y=0, z=1.00000",
-            "b : x=0, y=0, z=0.75000 : adjust CW 00:30",
-        ])
+        obj = self.learn({
+            "screw1": self.screw(1., "CW", "00:00", True),
+            "screw2": self.screw(0.75, "CW", "00:30"),
+        })
         self.assertEqual(obj._height_to_turns(0.004), 0)
         self.assertAlmostEqual(obj._height_to_turns(0.1), 0.2)
 

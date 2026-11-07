@@ -106,8 +106,20 @@ class FakeHeaters:
         return self.heaters[name]
 
 
+class FakeScrewsTiltAdjust:
+    """Holds results the way Klipper's screws_tilt_adjust does."""
+
+    def __init__(self):
+        self.screws = []
+        self.probe_helper = types.SimpleNamespace(probe_points=[])
+        self.results = {}
+
+    def get_status(self, eventtime):
+        return {"error": False, "max_deviation": 10., "results": self.results}
+
+
 class FakeGcode:
-    """Plays back SCREWS_TILT_CALCULATE results, one list of lines per call.
+    """Plays back SCREWS_TILT_CALCULATE results, one results dict per call.
     Each call takes `probe_time` seconds on the fake clock."""
 
     error = CommandError
@@ -117,13 +129,10 @@ class FakeGcode:
         self.rounds = list(rounds)
         self.probe_time = probe_time
         self.scripts = []
-        self.output_handler = None
+        self.sta = FakeScrewsTiltAdjust()
 
     def register_command(self, *args, **kwargs):
         pass
-
-    def register_output_handler(self, handler):
-        self.output_handler = handler
 
     def respond_info(self, msg):
         pass
@@ -135,8 +144,8 @@ class FakeGcode:
             result = self.rounds.pop(0)
             if isinstance(result, Exception):
                 raise result
-            for line in result:
-                self.output_handler(line)
+            # Klipper replaces its results with a new dict on every run
+            self.sta.results = result.copy()
 
 
 class FakeBoard:
@@ -182,14 +191,20 @@ class FakePrinter:
         return self.shutdown
 
 
-def adjust(name, direction, hhmm):
-    return "// %s : x=0, y=0, z=0 : adjust %s %s" % (name, direction, hhmm)
+def adjust(direction, hhmm, z=0.):
+    return {"z": z, "sign": direction, "adjust": hhmm, "is_base": False}
 
 
-LEVEL = [adjust("front right", "CW", "00:00"), adjust("rear right", "CW", "00:00"),
-         adjust("rear left", "CW", "00:00")]
-OFF = [adjust("front right", "CW", "00:30"), adjust("rear right", "CCW", "00:15"),
-       adjust("rear left", "CW", "00:00")]
+def results(*screws):
+    """Klipper's results for screw1 as the base, then the given screws."""
+    out = {"screw1": {"z": 0., "sign": "CW", "adjust": "00:00", "is_base": True}}
+    for i, screw in enumerate(screws):
+        out["screw%d" % (i + 2,)] = screw
+    return out
+
+
+LEVEL = results(adjust("CW", "00:00"), adjust("CW", "00:00"), adjust("CW", "00:00"))
+OFF = results(adjust("CW", "00:30"), adjust("CCW", "00:15"), adjust("CW", "00:00"))
 
 
 class TestBase(unittest.TestCase):
@@ -202,6 +217,7 @@ class TestBase(unittest.TestCase):
             "gcode": self.gcode,
             "toolhead": FakeToolhead(),
             "heaters": FakeHeaters(heaters),
+            "screws_tilt_adjust": self.gcode.sta,
         })
         values = {"serial_device": "/dev/null", "serial_baud": 115200}
         values.update(config or {})
@@ -258,7 +274,6 @@ class AutoAdjustTest(TestBase):
         obj = self.make([OFF, RuntimeError("probe failed")])
         with self.assertRaises(RuntimeError):
             obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd())
-        self.assertFalse(obj.active)
         self.assert_motors_stopped()
 
     def test_manual_command_stops_motors_on_error(self):

@@ -101,35 +101,40 @@ class ProgressCheckTest(unittest.TestCase):
         self.assertEqual(obj._check_screw_progress(1, 0.01, 0., 0.01, 0.02, 0), 0)
 
 
+def results(base_z, *screws):
+    """Klipper's results for a base screw at base_z, then (z, sign, adjust)
+    for each other screw."""
+    out = {"screw1": {"z": base_z, "sign": "CW", "adjust": "00:00", "is_base": True}}
+    for i, (z, sign, adjust) in enumerate(screws):
+        out["screw%d" % (i + 2,)] = {"z": z, "sign": sign, "adjust": adjust, "is_base": False}
+    return out
+
+
 class TurnsPerMmCheckTest(unittest.TestCase):
-    def learn(self, lines, thread=None):
+    def learn(self, results, thread=None):
         obj, bed, gcode, sta = make([0., 0., 0.])
         if thread is not None:
             sta.thread = thread
-        obj.active = True
-        for line in lines:
-            obj._handle_output(line)
+        # As if SCREWS_TILT_CALCULATE had just left these results
+        sta.results = results
+        gcode.run_script_from_command = lambda script: None
+        obj._measure_bed_tilt()
         obj._learn_turns_per_mm()
         return obj
 
-    M3 = ["a (base) : x=0, y=0, z=1.00000",
-          "b : x=0, y=0, z=0.75000 : adjust CW 00:30",
-          "c : x=0, y=0, z=1.10000 : adjust CCW 00:12"]
+    M3 = results(1., (0.75, "CW", "00:30"), (1.1, "CCW", "00:12"))
 
     def test_impossible_rate_is_an_error(self):
         with self.assertRaises(CommandError) as ctx:
-            self.learn(["a (base) : x=0, y=0, z=1.00000",
-                        "b : x=0, y=0, z=0.90000 : adjust CW 01:00"])
+            self.learn(results(1., (0.9, "CW", "01:00")))
         self.assertIn("no supported screw thread", str(ctx.exception))
 
     def test_uses_screw_thread_when_it_agrees(self):
-        obj = self.learn(["a (base) : x=0, y=0, z=1.00000",
-                          "b : x=0, y=0, z=0.74000 : adjust CW 00:31"], thread=0)
+        obj = self.learn(results(1., (0.74, "CW", "00:31")), thread=0)
         self.assertEqual(obj.turns_per_mm, 2.)
 
     def test_ccw_thread(self):
-        obj = self.learn(["a (base) : x=0, y=0, z=1.00000",
-                          "b : x=0, y=0, z=0.65000 : adjust CCW 00:30"], thread=3)
+        obj = self.learn(results(1., (0.65, "CCW", "00:30")), thread=3)
         self.assertAlmostEqual(obj.turns_per_mm, -1 / 0.7)
 
     def test_wrong_direction_for_screw_thread_is_an_error(self):
@@ -139,8 +144,7 @@ class TurnsPerMmCheckTest(unittest.TestCase):
 
     def test_tiny_tilt_is_not_compared(self):
         # Rounding to the minute makes small tilts learn a poor rate
-        obj = self.learn(["a (base) : x=0, y=0, z=1.00000",
-                          "b : x=0, y=0, z=0.99000 : adjust CW 00:01"], thread=6)
+        obj = self.learn(results(1., (0.99, "CW", "00:01")), thread=6)
         self.assertEqual(obj.turns_per_mm, 1.)
 
 

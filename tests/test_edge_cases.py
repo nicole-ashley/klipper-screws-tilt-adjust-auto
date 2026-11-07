@@ -9,30 +9,48 @@ sys.path.insert(0, os.path.dirname(__file__))
 from test_one_by_one import CommandError, make  # noqa: E402
 from test_screws_tilt_adjust_auto import (  # noqa: E402
     LEVEL, OFF, CommandError as HeaterCommandError, FakeBoard, FakeConfig, FakeGcmd as HeaterGcmd, FakeGcode,
-    FakePrinter, FakeReactor, TestBase, adjust, staa)
+    FakePrinter, FakeReactor, TestBase, adjust, results, staa)
 
 
-class OutputParsingTest(unittest.TestCase):
-    def test_ignores_output_when_not_measuring(self):
-        obj, bed, gcode, sta = make([0., 0.])
-        obj._handle_output("b : x=0, y=0, z=0.50000 : adjust CW 00:30")
-        self.assertEqual(obj.heights, [])
-        self.assertEqual(obj.measurements, [])
+class ResultsReadingTest(TestBase):
+    def test_reads_heights_and_turns_from_klipper_results(self):
+        obj = self.make([results(adjust("CCW", "01:05", z=-0.125), adjust("CW", "00:30", z=0.25))])
+        obj._measure_bed_tilt()
+        self.assertEqual(obj.heights, [0., -0.125, 0.25])
+        self.assertAlmostEqual(obj.adjustments[1], -(1 + 5 / 60.))
+        self.assertEqual(obj.adjustments[2], 0.5)
+        self.assertEqual(obj.base, 0)
 
-    def test_ignores_unrelated_output_while_measuring(self):
-        obj, bed, gcode, sta = make([0., 0.])
-        obj.active = True
-        obj._handle_output("// Some other message")
-        self.assertEqual(obj.heights, [])
-        self.assertEqual(obj.measurements, [])
+    def test_does_not_read_the_console(self):
+        # Klipper's console wording can change without affecting the extra
+        obj = self.make([LEVEL])
+        self.assertFalse(hasattr(self.gcode, "output_handler"))
+        obj.cmd_SCREWS_TILT_ADJUST_AUTO(HeaterGcmd())
+        self.assertEqual(self.calculate_count(), 1)
 
-    def test_reads_negative_heights(self):
-        obj, bed, gcode, sta = make([0., 0.])
-        obj.active = True
-        obj._handle_output("b : x=1.5, y=-2, z=-0.12500 : adjust CCW 01:05")
-        self.assertEqual(obj.heights, [-0.125])
-        self.assertEqual(obj.measurements, [
-            {"direction": "CCW", "hours": "01", "minutes": "05"}])
+    def test_klipper_without_results_in_status_is_an_error(self):
+        # Klipper versions whose status only had error and max_deviation
+        obj = self.make([LEVEL])
+        self.gcode.sta.get_status = lambda eventtime: {"error": False, "max_deviation": None}
+        with self.assertRaises(HeaterCommandError) as ctx:
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(HeaterGcmd())
+        self.assertIn("Couldn't read any screw results", str(ctx.exception))
+        self.assert_motors_stopped()
+
+    def test_klipper_with_results_as_a_list_is_an_error(self):
+        # Klipper from December 2022 to January 2023 kept a list instead
+        obj = self.make([[{"name": "screw1 (base)", "x": 0., "y": 0., "z": 0.}]])
+        with self.assertRaises(HeaterCommandError) as ctx:
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(HeaterGcmd())
+        self.assertIn("January 2023 or later", str(ctx.exception))
+
+    def test_klipper_without_screws_tilt_adjust_status_is_an_error(self):
+        obj = self.make([LEVEL])
+        del self.gcode.sta.results
+        with self.assertRaises(HeaterCommandError) as ctx:
+            obj.cmd_SCREWS_TILT_ADJUST_AUTO(HeaterGcmd())
+        self.assertIn("supported Klipper version", str(ctx.exception))
+        self.assertEqual(self.calculate_count(), 0)
 
 
 class BoardConnectionTest(TestBase):
@@ -143,30 +161,40 @@ class HomingTest(TestBase):
 
 
 class MotorMovementsTest(TestBase):
-    def movements(self, lines):
-        obj = self.make([lines])
+    def movements(self, *screws):
+        obj = self.make([results(*screws)])
         obj._measure_bed_tilt()
         return obj._calculate_motor_movements()
 
     def test_mixed_directions_leave_base_screw_alone(self):
-        self.assertEqual(self.movements(OFF), [0, 0.5, -0.25, 0])
+        obj = self.make([OFF])
+        obj._measure_bed_tilt()
+        self.assertEqual(obj._calculate_motor_movements(), [0, 0.5, -0.25, 0])
 
     def test_all_clockwise_moves_base_screw_instead(self):
-        self.assertEqual(self.movements([
-            adjust("b", "CW", "00:30"), adjust("c", "CW", "00:15")]), [-0.25, 0.25, 0])
+        self.assertEqual(self.movements(
+            adjust("CW", "00:30"), adjust("CW", "00:15")), [-0.25, 0.25, 0])
 
     def test_all_anticlockwise_moves_base_screw_instead(self):
-        self.assertEqual(self.movements([
-            adjust("b", "CCW", "01:00"), adjust("c", "CCW", "00:30")]), [0.5, -0.5, 0])
+        self.assertEqual(self.movements(
+            adjust("CCW", "01:00"), adjust("CCW", "00:30")), [0.5, -0.5, 0])
+
+    def test_base_screw_need_not_be_first(self):
+        obj = self.make([{
+            "screw1": adjust("CW", "00:30"),
+            "screw2": dict(adjust("CW", "00:00"), is_base=True),
+            "screw3": adjust("CCW", "00:15"),
+        }])
+        obj._measure_bed_tilt()
+        self.assertEqual(obj._calculate_motor_movements(), [0.5, 0, -0.25])
 
 
-class UnreadableOutputTest(TestBase):
-    def test_no_adjustments_read_is_an_error_not_level(self):
-        # e.g. if Klipper changed how SCREWS_TILT_CALCULATE reports results
-        obj = self.make([["// screw2 is 0.1mm out"]])
+class UnreadableResultsTest(TestBase):
+    def test_no_results_is_an_error_not_level(self):
+        obj = self.make([{}])
         with self.assertRaises(HeaterCommandError) as ctx:
             obj.cmd_SCREWS_TILT_ADJUST_AUTO(HeaterGcmd())
-        self.assertIn("Couldn't read any screw adjustments", str(ctx.exception))
+        self.assertIn("Couldn't read any screw results", str(ctx.exception))
         self.assertEqual(self.home_z_count(), 0)
         self.assert_motors_stopped()
 
@@ -189,21 +217,18 @@ class HeaterListTest(TestBase):
 
 
 class OneByOneErrorsTest(unittest.TestCase):
-    def test_wrong_number_of_heights_is_an_error(self):
-        obj, bed, gcode, sta = make([0., 0.2])
-        obj.heights = [0.]
-        with self.assertRaises(CommandError) as ctx:
-            obj._adjust_one_by_one([0, 0.4])
-        self.assertIn("Expected 2 screw heights but got 1", str(ctx.exception))
-
-    def test_single_screw_measurement_without_a_height_is_an_error(self):
+    def test_single_screw_measurement_with_more_results_is_an_error(self):
         obj, bed, gcode, sta = make([0., 0.2, 0.1])
         screws = list(sta.screws)
         points = list(sta.probe_helper.probe_points)
-        gcode.output_handler = lambda line: None  # Klipper printed nothing we recognise
+        # As if Klipper ignored the narrowed screw list and probed them all
+        def probe_all(script):
+            sta.results = {"screw1": {"z": 0., "sign": "CW", "adjust": "00:00", "is_base": True},
+                           "screw2": {"z": 0.2, "sign": "CCW", "adjust": "00:24", "is_base": False}}
+        gcode.run_script_from_command = probe_all
         with self.assertRaises(CommandError) as ctx:
             obj._measure_screw(1)
-        self.assertIn("Expected 1 screw height but got 0", str(ctx.exception))
+        self.assertIn("Expected 1 screw height but got 2", str(ctx.exception))
         # Klipper's own screw list is put back regardless
         self.assertEqual(sta.screws, screws)
         self.assertEqual(sta.probe_helper.probe_points, points)
@@ -213,12 +238,12 @@ class OneByOneErrorsTest(unittest.TestCase):
         obj._measure_screw(1)
         self.assertEqual(sta.results, {"original": True})
 
-    def test_works_with_klipper_versions_without_results(self):
+    def test_single_screw_measurement_does_not_replace_the_full_one(self):
         obj, bed, gcode, sta = make([0., 0.2, 0.1])
-        del sta.results
+        obj._measure_bed_tilt()
+        heights = list(obj.heights)
         self.assertAlmostEqual(obj._measure_screw(1), 0.2)
-        # Nothing to restore, so whatever the measurement left is kept
-        self.assertEqual(sta.results, {})
+        self.assertEqual(obj.heights, heights)
 
     def test_screws_tilt_adjust_without_probe_points_is_an_error(self):
         obj, bed, gcode, sta = make([0., 0.2, 0.1])
@@ -230,7 +255,8 @@ class OneByOneErrorsTest(unittest.TestCase):
     def test_measurement_with_no_height_change_cannot_learn_turns(self):
         obj, bed, gcode, sta = make([0., 0.])
         obj.heights = [1., 1.]
-        obj.measurements = [{"direction": "CW", "hours": "00", "minutes": "30"}]
+        obj.adjustments = [0., 0.5]
+        obj.base = 0
         with self.assertRaises(CommandError) as ctx:
             obj._learn_turns_per_mm()
         self.assertIn("turns per mm", str(ctx.exception))
@@ -299,7 +325,6 @@ class ConfigTest(unittest.TestCase):
                                       "SCREWS_TILT_ADJUST_AUTO_CANCEL",
                                       "SCREWS_TILT_ADJUST_AUTO_TEST",
                                       "_SCREWS_TILT_ADJUST_AUTO_CLOSE_DIALOG"])
-        self.assertEqual(gcode.output_handler, obj._handle_output)
 
 
 if __name__ == "__main__":
