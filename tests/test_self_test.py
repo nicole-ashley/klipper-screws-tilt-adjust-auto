@@ -115,7 +115,7 @@ class FullBedTest(unittest.TestCase):
 
     def test_turns_option(self):
         obj, bed, gcode = full()
-        self.run_test(obj, {"TURNS": 0.25})
+        self.run_test(obj, {"TURNS": 0.25, "DEBUG": 1})
         # 0.25 turns at the default 3 seconds a turn
         self.assertIn("STAA: 1 for 0.750 seconds.", obj.gcode.responses)
 

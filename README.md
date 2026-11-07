@@ -80,6 +80,15 @@ scan_sample_time: 0.5   # seconds of readings averaged for each check
 
 Set your heater targets first (for example with `M140 S60` and `M104 S200`), then run the command.
 
+### Console output
+By default the console shows roughly what `SCREWS_TILT_CALCULATE` does: Klipper's own table for each full measurement, then one line saying which screws are being turned and by how much, in the same `CW 00:18` format, and a line when the bed is level. One screw at a time and continuous modes add a line as each screw gets level, the motor test gives one line per motor, and calibration shows its results. Heater waits and anything that goes wrong are always shown.
+
+To see every step (each motor run and how long for, each reading of a single screw, learned speed changes, every calibration move, each motor test reading, and Klipper's own output for single screw measurements and motor test measurements), add `DEBUG=1` to any of the commands, or turn it on for every run:
+```ini
+debug: True     # DEBUG=0 on a command turns it off for that run
+```
+Everything Klipper prints still goes to `klippy.log` either way, and if a single screw measurement fails, the readings it held back are shown with the error.
+
 ### Safety limits
 So that a bad reading or a motor wired the wrong way can't wind a screw out of the bed, every run stops with an error, and leaves the motors stopped, if:
 - any single turn would be bigger than `max_turns_per_move`. Nothing moves if the first measurement asks for too much, so a badly out of level bed needs levelling by hand (or with `SCREWS_TILT_ADJUST_MANUAL`) first, or a higher limit.
