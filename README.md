@@ -22,5 +22,23 @@ primary_branch: main
 managed_services: klipper
 ```
 
+## Usage
+- `SCREWS_TILT_ADJUST_AUTO` measures the bed and turns the screws until it is level, then homes Z if any screw was moved.
+- `SCREWS_TILT_ADJUST_AUTO WAIT_FOR_HEATERS=1 [HEATERS=heater_bed,extruder]` levels while the heaters warm up, then again once they're at temperature to cater for heat flex:
+  1. If the heaters are already at their targets, it levels once and stops.
+  2. Otherwise it levels straight away while they heat.
+  3. If the heaters were already at their targets when the measurement that found the bed level was taken, it stops.
+  4. Otherwise it waits for them to reach their targets, then levels again.
+
+  "At target" uses the same test Klipper's own heat-and-wait commands (`M109`, `M190`) use. Only heaters with a target set are waited on. `HEATERS` limits which heaters are checked and defaults to all of them. Z is homed at the end of every levelling pass that moved a screw. If the first pass can't reach level while the bed is still heating, that's not an error; the pass at temperature is the one that has to succeed.
+- `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns>` turns one screw motor by the given number of turns (negative for counter-clockwise).
+
+Set your heater targets first (for example with `M140 S60` and `M104 S200`), then run the command.
+
+## Running the tests
+```sh
+python3 -m unittest discover -s tests
+```
+
 ## Printing and assembly
 _Coming soon._
