@@ -31,6 +31,12 @@ managed_services: klipper
   4. Otherwise it waits for them to reach their targets, then levels again.
 
   "At target" uses the same test Klipper's own heat-and-wait commands (`M109`, `M190`) use. Only heaters with a target set are waited on. `HEATERS` limits which heaters are checked and defaults to all of them. Z is homed at the end of every levelling pass that moved a screw. If the first pass can't reach level while the bed is still heating, that's not an error; the pass at temperature is the one that has to succeed.
+- `SCREWS_TILT_ADJUST_AUTO ONE_BY_ONE=1` levels one screw at a time instead of moving every screw after each full measurement:
+  1. Measure every screw.
+  2. For each screw that needs moving: turn it, then probe just that screw and compare it to the height the full measurement says it should be at. Repeat until it's level.
+  3. Go back to step 1, until a full measurement shows the bed is level.
+
+  How far to turn per millimetre is worked out from Klipper's own full measurement, so it follows whatever `screw_thread` you've set. It can be combined with `WAIT_FOR_HEATERS=1`. If a screw can't be levelled within `maximum_attempts` turns, the run stops with an error.
 - `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns>` turns one screw motor by the given number of turns (negative for counter-clockwise).
 
 Set your heater targets first (for example with `M140 S60` and `M104 S200`), then run the command.

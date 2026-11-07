@@ -18,6 +18,8 @@ class ScrewsTiltAdjustAuto:
         self.full_turn_time_in_seconds = config.getfloat("full_turn_time_in_seconds", 3)
         self.maximum_attempts = config.getint("maximum_attempts", 10)
         self.board = None
+        self.one_by_one = False
+        self.heights = []
 
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -32,6 +34,9 @@ class ScrewsTiltAdjustAuto:
 
     def _handle_output(self, output):
         if self.active:
+            match = re.search(r": x=[-\d.]+, y=[-\d.]+, z=(-?[\d.]+)", output)
+            if match is not None:
+                self.heights.append(float(match.group(1)))
             match = re.search(r":[^:]+: adjust (C?CW) (\d+):(\d+)", output)
             if match is not None:
                 self.measurements.append({
@@ -90,6 +95,7 @@ class ScrewsTiltAdjustAuto:
 
     cmd_SCREWS_TILT_ADJUST_AUTO_help = "Tool to automatically adjust bed level screws"
     def cmd_SCREWS_TILT_ADJUST_AUTO(self, gcmd):
+        self.one_by_one = bool(gcmd.get_int("ONE_BY_ONE", 0, minval=0, maxval=1))
         if gcmd.get_int("WAIT_FOR_HEATERS", 0, minval=0, maxval=1):
             self._adjust_while_heating(gcmd)
         else:
@@ -105,7 +111,7 @@ class ScrewsTiltAdjustAuto:
         # Returns True once the bed is level, or False if it ran out of
         # attempts. When heaters are given, also records whether they were
         # at target just before the last measurement was taken.
-        self.gcode.respond_info("STAA: Starting")
+        self.gcode.respond_info("STAA: Starting" + (" (one by one)" if self.one_by_one else ""))
         self.heaters_at_target_before_last_measurement = False
 
         self._home_if_necessary()
@@ -124,8 +130,11 @@ class ScrewsTiltAdjustAuto:
                     level = True
                     break
                 self.gcode.respond_info("STAA: Motor movements: " + ", ".join(map(str, movements)))
-                self._turn_motors(movements)
                 adjustments_made = True
+                if not self.one_by_one:
+                    self._turn_motors(movements)
+                elif not self._adjust_one_by_one(movements):
+                    break
         finally:
             self._disconnect_from_board()
 
@@ -135,6 +144,39 @@ class ScrewsTiltAdjustAuto:
         if level:
             self.gcode.respond_info("STAA: Done")
         return level
+
+    def _adjust_one_by_one(self, movements):
+        # Settle each screw in turn, probing only that screw between turns
+        # and comparing it to the height the full measurement says it should
+        # be at (that of a screw that doesn't need moving). The caller does a
+        # full measurement again afterwards, since moving one screw can
+        # slightly change the others. Returns False if a screw couldn't be
+        # settled within maximum_attempts.
+        if len(self.heights) != len(movements):
+            raise self.gcode.error(
+                "STAA: Expected %d screw heights but got %d" % (len(movements), len(self.heights)))
+        target = self.heights[movements.index(0)]
+        self._learn_turns_per_mm()
+        for screw, movement in enumerate(movements):
+            if movement == 0:
+                continue
+            for attempt in range(self.maximum_attempts):
+                self.gcode.respond_info("STAA: Screw %d movement: %s" % (screw + 1, movement))
+                self._turn_motors(self._single_motor(screw, movement, len(movements)))
+                movement = self._height_to_turns(target - self._measure_screw(screw))
+                if movement == 0:
+                    break
+            else:
+                self.gcode.respond_info("STAA: Unable to level screw %d after %s attempts" % (
+                    screw + 1, self.maximum_attempts))
+                return False
+            self.gcode.respond_info("STAA: Screw %d level" % (screw + 1,))
+        return True
+
+    def _single_motor(self, screw, movement, count):
+        movements = [0] * count
+        movements[screw] = movement
+        return movements
 
     def _adjust_while_heating(self, gcmd):
         heaters = self._lookup_heaters(gcmd)
@@ -224,20 +266,78 @@ class ScrewsTiltAdjustAuto:
             self.gcode.run_script_from_command("G28")
 
     def _measure_bed_tilt(self):
+        self.gcode.respond_info("STAA: Measuring bed tilt")
+        self._run_screws_tilt_calculate()
+
+    def _run_screws_tilt_calculate(self):
         self.active = True
         self.measurements = []
-        self.gcode.respond_info("STAA: Measuring bed tilt")
+        self.heights = []
         try:
             self.gcode.run_script_from_command("SCREWS_TILT_CALCULATE MAX_DEVIATION=10")
         finally:
             self.active = False
 
+    def _measure_screw(self, screw):
+        # Klipper's screws_tilt_adjust probes every screw it's configured
+        # with, so narrow it to just this screw while we measure. Using the
+        # same probing as the full measurement keeps the heights comparable.
+        sta = self._lookup_screws_tilt_adjust()
+        screws = sta.screws
+        probe_points = sta.probe_helper.probe_points
+        results = getattr(sta, "results", None)
+        self.gcode.respond_info("STAA: Measuring screw %d" % (screw + 1,))
+        try:
+            sta.screws = [screws[screw]]
+            sta.probe_helper.probe_points = [coord for coord, name in sta.screws]
+            self._run_screws_tilt_calculate()
+        finally:
+            sta.screws = screws
+            sta.probe_helper.probe_points = probe_points
+            if results is not None:
+                sta.results = results
+        if len(self.heights) != 1:
+            raise self.gcode.error(
+                "STAA: Expected 1 screw height but got %d" % (len(self.heights),))
+        return self.heights[0]
+
+    def _learn_turns_per_mm(self):
+        # Work out how many turns move the bed 1mm (and which way) from the
+        # last full measurement, where Klipper reports both the height and
+        # the turns for each screw against the base (screw 1). A best fit
+        # across all screws smooths out Klipper's rounding to the minute.
+        base = self.heights[0]
+        pairs = [(base - z, self._measurement_to_turns(m))
+                 for z, m in zip(self.heights[1:], self.measurements)]
+        total = sum(diff * diff for diff, turns in pairs)
+        if total == 0:
+            raise self.gcode.error("STAA: Couldn't work out turns per mm from the measurement")
+        self.turns_per_mm = sum(diff * turns for diff, turns in pairs) / total
+
+    def _height_to_turns(self, diff):
+        # How far to turn a screw to raise its corner of the bed by diff mm.
+        # Anything under half a minute is level, as SCREWS_TILT_CALCULATE
+        # would report it as 00:00.
+        turns = diff * self.turns_per_mm
+        if abs(turns) * 60 < 0.5:
+            return 0
+        return turns
+
+    def _lookup_screws_tilt_adjust(self):
+        sta = self.printer.lookup_object('screws_tilt_adjust', None)
+        if (sta is None or not hasattr(sta, "screws")
+                or not hasattr(getattr(sta, "probe_helper", None), "probe_points")):
+            raise self.gcode.error(
+                "STAA: One by one mode needs [screws_tilt_adjust] from a supported Klipper version")
+        return sta
+
+    def _measurement_to_turns(self, m):
+        direction = 1 if m["direction"] == "CW" else -1
+        turns = float(m["hours"]) + (float(m["minutes"]) / 60)
+        return turns * direction
+
     def _calculate_motor_movements(self):
-        movements = []
-        for m in self.measurements:
-            direction = 1 if m["direction"] == "CW" else -1
-            turns = float(m["hours"]) + (float(m["minutes"]) / 60)
-            movements.append(turns * direction)
+        movements = [self._measurement_to_turns(m) for m in self.measurements]
 
         base_offset = 0
         if all(m > 0 for m in movements):
