@@ -4,7 +4,6 @@
 #
 # This file may be distributed under the terms of the MIT license.
 import contextlib
-import re
 import serial
 
 HANDSHAKE_TIMEOUT = 30.
@@ -12,8 +11,6 @@ HEATER_REPORT_INTERVAL = 10.
 
 class ScrewsTiltAdjustAuto:
     def __init__(self, config):
-        self.active = False
-        self.measurements = []
         self.serial_device = config.get("serial_device")
         self.serial_baud = config.get("serial_baud")
         self.full_turn_time_in_seconds = config.getfloat("full_turn_time_in_seconds", 3)
@@ -23,7 +20,11 @@ class ScrewsTiltAdjustAuto:
         self.board = None
         self.one_by_one = False
         self.continuous = False
+        # From the last SCREWS_TILT_CALCULATE, one entry per screw: its
+        # height, and the turns Klipper says it needs (+ clockwise)
         self.heights = []
+        self.adjustments = []
+        self.base = 0
 
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -34,20 +35,6 @@ class ScrewsTiltAdjustAuto:
         self.gcode.register_command("SCREWS_TILT_ADJUST_MANUAL",
                                     self.cmd_SCREWS_TILT_ADJUST_MANUAL,
                                     desc=self.cmd_SCREWS_TILT_ADJUST_MANUAL_help)
-        self.gcode.register_output_handler(self._handle_output)
-
-    def _handle_output(self, output):
-        if self.active:
-            match = re.search(r": x=[-\d.]+, y=[-\d.]+, z=(-?[\d.]+)", output)
-            if match is not None:
-                self.heights.append(float(match.group(1)))
-            match = re.search(r":[^:]+: adjust (C?CW) (\d+):(\d+)", output)
-            if match is not None:
-                self.measurements.append({
-                    "direction": match.group(1),
-                    "hours": match.group(2),
-                    "minutes": match.group(3)
-                })
 
     def _pause(self, seconds):
         # Let Klipper keep running (heater control in particular) while we
@@ -175,9 +162,6 @@ class ScrewsTiltAdjustAuto:
         # full measurement again afterwards, since moving one screw can
         # slightly change the others. Returns False if a screw couldn't be
         # settled within maximum_attempts.
-        if len(self.heights) != len(movements):
-            raise self.gcode.error(
-                "STAA: Expected %d screw heights but got %d" % (len(movements), len(self.heights)))
         target = self.heights[movements.index(0)]
         self._learn_turns_per_mm()
         for screw, movement in enumerate(movements):
@@ -366,16 +350,36 @@ class ScrewsTiltAdjustAuto:
 
     def _measure_bed_tilt(self):
         self.gcode.respond_info("STAA: Measuring bed tilt")
-        self._run_screws_tilt_calculate()
+        screws = self._run_screws_tilt_calculate()
+        self.heights = [z for z, turns, is_base in screws]
+        self.adjustments = [turns for z, turns, is_base in screws]
+        self.base = [is_base for z, turns, is_base in screws].index(True)
 
     def _run_screws_tilt_calculate(self):
-        self.active = True
-        self.measurements = []
-        self.heights = []
-        try:
-            self.gcode.run_script_from_command("SCREWS_TILT_CALCULATE MAX_DEVIATION=10")
-        finally:
-            self.active = False
+        # Returns (height, turns, is_base) for each screw measured, in
+        # Klipper's screw order. Turns are positive for clockwise.
+        sta = self._lookup_screws_tilt_adjust()
+        self.gcode.run_script_from_command("SCREWS_TILT_CALCULATE MAX_DEVIATION=10")
+        # Klipper keeps the results of the last run on screws_tilt_adjust,
+        # so read them from there rather than from the console
+        results = sta.get_status(self.reactor.monotonic()).get("results")
+        if not isinstance(results, dict) or not results:
+            # Without this the bed would look level and nothing would move.
+            # Klipper before January 2023 had no results, or a list of them
+            # without the turns.
+            raise self.gcode.error(
+                "STAA: Couldn't read any screw results from SCREWS_TILT_CALCULATE."
+                " This needs Klipper from January 2023 or later.")
+        # Each result is named after the screw's place in Klipper's list:
+        # screw1, screw2, ...
+        screws = sorted(results.items(), key=lambda item: int(item[0][len("screw"):]))
+        return [(float(r["z"]), self._result_to_turns(r), r["is_base"])
+                for name, r in screws]
+
+    def _result_to_turns(self, result):
+        hours, minutes = result["adjust"].split(":")
+        turns = int(hours) + int(minutes) / 60.
+        return turns if result["sign"] == "CW" else -turns
 
     def _measure_screw(self, screw):
         # Klipper's screws_tilt_adjust probes every screw it's configured
@@ -384,30 +388,31 @@ class ScrewsTiltAdjustAuto:
         sta = self._lookup_screws_tilt_adjust()
         screws = sta.screws
         probe_points = sta.probe_helper.probe_points
-        results = getattr(sta, "results", None)
+        results = sta.results
         self.gcode.respond_info("STAA: Measuring screw %d" % (screw + 1,))
         try:
             sta.screws = [screws[screw]]
             sta.probe_helper.probe_points = [coord for coord, name in sta.screws]
-            self._run_screws_tilt_calculate()
+            measured = self._run_screws_tilt_calculate()
         finally:
             sta.screws = screws
             sta.probe_helper.probe_points = probe_points
-            if results is not None:
-                sta.results = results
-        if len(self.heights) != 1:
+            # Leave Klipper's results showing the full measurement
+            sta.results = results
+        if len(measured) != 1:
             raise self.gcode.error(
-                "STAA: Expected 1 screw height but got %d" % (len(self.heights),))
-        return self.heights[0]
+                "STAA: Expected 1 screw height but got %d" % (len(measured),))
+        return measured[0][0]
 
     def _learn_turns_per_mm(self):
         # Work out how many turns move the bed 1mm (and which way) from the
         # last full measurement, where Klipper reports both the height and
-        # the turns for each screw against the base (screw 1). A best fit
+        # the turns for each screw against the base screw. A best fit
         # across all screws smooths out Klipper's rounding to the minute.
-        base = self.heights[0]
-        pairs = [(base - z, self._measurement_to_turns(m))
-                 for z, m in zip(self.heights[1:], self.measurements)]
+        base = self.heights[self.base]
+        pairs = [(base - z, turns)
+                 for i, (z, turns) in enumerate(zip(self.heights, self.adjustments))
+                 if i != self.base]
         total = sum(diff * diff for diff, turns in pairs)
         if total == 0:
             raise self.gcode.error("STAA: Couldn't work out turns per mm from the measurement")
@@ -424,34 +429,24 @@ class ScrewsTiltAdjustAuto:
 
     def _lookup_screws_tilt_adjust(self):
         sta = self.printer.lookup_object('screws_tilt_adjust', None)
-        if (sta is None or not hasattr(sta, "screws")
+        if (sta is None or not hasattr(sta, "screws") or not hasattr(sta, "results")
+                or not hasattr(sta, "get_status")
                 or not hasattr(getattr(sta, "probe_helper", None), "probe_points")):
             raise self.gcode.error(
-                "STAA: One by one mode needs [screws_tilt_adjust] from a supported Klipper version")
+                "STAA: Needs [screws_tilt_adjust] from a supported Klipper version")
         return sta
 
-    def _measurement_to_turns(self, m):
-        direction = 1 if m["direction"] == "CW" else -1
-        turns = float(m["hours"]) + (float(m["minutes"]) / 60)
-        return turns * direction
-
     def _calculate_motor_movements(self):
-        if not self.measurements:
-            # Without this the bed would look level and nothing would move
-            raise self.gcode.error(
-                "STAA: Couldn't read any screw adjustments from SCREWS_TILT_CALCULATE")
-        movements = [self._measurement_to_turns(m) for m in self.measurements]
-
+        # Klipper never asks for the base screw to move. If every other
+        # screw needs turning the same way, turn the base screw the other
+        # way instead, and leave the screw that needs the least alone.
+        others = [turns for i, turns in enumerate(self.adjustments) if i != self.base]
         base_offset = 0
-        if all(m > 0 for m in movements):
-            base_offset = min(movements)
-        elif all(m < 0 for m in movements):
-            base_offset = max(movements)
-        base_offset *= -1
-        movements = [m + base_offset for m in movements]
-        movements.insert(0, base_offset)
-
-        return movements
+        if all(m > 0 for m in others):
+            base_offset = min(others)
+        elif all(m < 0 for m in others):
+            base_offset = max(others)
+        return [m - base_offset for m in self.adjustments]
 
     def _turn_motors(self, movements):
         for motor, distance in enumerate(movements, start=1):
