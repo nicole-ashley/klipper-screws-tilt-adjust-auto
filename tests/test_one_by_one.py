@@ -34,12 +34,6 @@ class FakeConfig:
     def get_printer(self):
         return self.printer
 
-    def has_section(self, name):
-        return name in self.values.get("sections", {})
-
-    def getsection(self, name):
-        return FakeConfig(self.printer, self.values["sections"][name])
-
 
 class FakeGcmd:
     def __init__(self, params=None):
@@ -217,7 +211,9 @@ def make(heights, efficiency=1., attempts=10, with_sta=True):
 
 
 def is_level(bed):
-    return max(bed.heights) - min(bed.heights) < 0.5 / 120 + 1e-9
+    # Level as SCREWS_TILT_CALCULATE sees it: every screw reads 00:00
+    # against screw 1
+    return all(abs(h - bed.heights[0]) < 0.5 / 120 for h in bed.heights)
 
 
 class OneByOneTest(unittest.TestCase):
@@ -295,28 +291,39 @@ class FakeHeaters:
         return FakeHeater()
 
 
-class ThreadTest(unittest.TestCase):
-    def make_with_thread(self, thread):
+class TurnsPerMmTest(unittest.TestCase):
+    def learn(self, lines):
         obj, bed, gcode, sta = make([0., 0., 0.])
-        obj._read_screw_thread(FakeConfig(None, {
-            "sections": {"screws_tilt_adjust": {"screw_thread": thread}}}))
+        obj.active = True
+        for line in lines:
+            obj._handle_output(line)
+        obj._learn_turns_per_mm()
         return obj
 
-    def test_defaults_to_cw_m3(self):
-        obj, bed, gcode, sta = make([0., 0., 0.])
-        self.assertEqual(obj._height_to_turns(0.25), 0.5)
-        self.assertEqual(obj._height_to_turns(-0.25), -0.5)
+    def test_learns_cw_thread_from_measurement(self):
+        obj = self.learn([
+            "a (base) : x=0, y=0, z=1.00000",
+            "b : x=0, y=0, z=0.75000 : adjust CW 00:30",
+            "c : x=0, y=0, z=1.10000 : adjust CCW 00:12",
+        ])
+        self.assertAlmostEqual(obj.turns_per_mm, 2.)
+        self.assertAlmostEqual(obj._height_to_turns(0.25), 0.5)
 
-    def test_reads_thread_from_screws_tilt_adjust(self):
-        obj = self.make_with_thread("CCW-M4")
-        self.assertAlmostEqual(obj._height_to_turns(0.35), -0.5)
-        self.assertAlmostEqual(obj._height_to_turns(-0.7), 1.)
+    def test_learns_ccw_thread_from_measurement(self):
+        obj = self.learn([
+            "a (base) : x=0, y=0, z=1.00000",
+            "b : x=0, y=0, z=0.65000 : adjust CCW 00:30",
+            "c : x=0, y=0, z=1.00000 : adjust CW 00:00",
+        ])
+        self.assertAlmostEqual(obj.turns_per_mm, -1 / 0.7)
 
-    def test_rounds_to_the_minute_like_klipper(self):
-        obj = self.make_with_thread("CW-M3")
-        self.assertEqual(obj._height_to_turns(0.0005), 0)
+    def test_under_half_a_minute_is_level(self):
+        obj = self.learn([
+            "a (base) : x=0, y=0, z=1.00000",
+            "b : x=0, y=0, z=0.75000 : adjust CW 00:30",
+        ])
         self.assertEqual(obj._height_to_turns(0.004), 0)
-        self.assertAlmostEqual(obj._height_to_turns(0.1), 12 / 60.)
+        self.assertAlmostEqual(obj._height_to_turns(0.1), 0.2)
 
 
 class OneByOneWithHeatersTest(unittest.TestCase):

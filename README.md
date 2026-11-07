@@ -36,7 +36,7 @@ managed_services: klipper
   2. For each screw that needs moving: turn it, then probe just that screw and compare it to the height the full measurement says it should be at. Repeat until it's level.
   3. Go back to step 1, until a full measurement shows the bed is level.
 
-  Turns are worked out from `screw_thread` in your `[screws_tilt_adjust]` section, as Klipper does. It can be combined with `WAIT_FOR_HEATERS=1`. If a screw can't be levelled within `maximum_attempts` turns, the run stops with an error.
+  How far to turn per millimetre is worked out from Klipper's own full measurement, so it follows whatever `screw_thread` you've set. It can be combined with `WAIT_FOR_HEATERS=1`. If a screw can't be levelled within `maximum_attempts` turns, the run stops with an error.
 - `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns>` turns one screw motor by the given number of turns (negative for counter-clockwise).
 
 Set your heater targets first (for example with `M140 S60` and `M104 S200`), then run the command.

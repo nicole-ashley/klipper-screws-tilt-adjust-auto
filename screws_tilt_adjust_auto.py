@@ -3,15 +3,11 @@
 # Copyright (C) 2024  Nicole Ashley <nicole@ashley.kiwi>
 #
 # This file may be distributed under the terms of the MIT license.
-import math
 import re
 import serial
 
 HANDSHAKE_TIMEOUT = 30.
 HEATER_REPORT_INTERVAL = 10.
-
-# Bed movement in mm per full turn, as Klipper's screws_tilt_adjust uses
-THREAD_PITCHES = {"M3": 0.5, "M4": 0.7, "M5": 0.8, "M6": 1.0}
 
 class ScrewsTiltAdjustAuto:
     def __init__(self, config):
@@ -24,7 +20,6 @@ class ScrewsTiltAdjustAuto:
         self.board = None
         self.one_by_one = False
         self.heights = []
-        self._read_screw_thread(config)
 
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -36,16 +31,6 @@ class ScrewsTiltAdjustAuto:
                                     self.cmd_SCREWS_TILT_ADJUST_MANUAL,
                                     desc=self.cmd_SCREWS_TILT_ADJUST_MANUAL_help)
         self.gcode.register_output_handler(self._handle_output)
-
-    def _read_screw_thread(self, config):
-        # Read the thread from [screws_tilt_adjust] so one by one mode can
-        # turn a single screw's height into turns, the same way Klipper does
-        thread = "CW-M3"
-        if config.has_section("screws_tilt_adjust"):
-            thread = config.getsection("screws_tilt_adjust").get("screw_thread", thread)
-        direction, size = thread.upper().split("-")
-        self.thread_pitch = THREAD_PITCHES.get(size, 0.5)
-        self.clockwise_thread = direction == "CW"
 
     def _handle_output(self, output):
         if self.active:
@@ -161,7 +146,11 @@ class ScrewsTiltAdjustAuto:
         # full measurement again afterwards, since moving one screw can
         # slightly change the others. Returns False if a screw couldn't be
         # settled within maximum_attempts.
+        if len(self.heights) != len(movements):
+            raise self.gcode.error(
+                "STAA: Expected %d screw heights but got %d" % (len(movements), len(self.heights)))
         target = self.heights[movements.index(0)]
+        self._learn_turns_per_mm()
         for screw, movement in enumerate(movements):
             if movement == 0:
                 continue
@@ -304,16 +293,27 @@ class ScrewsTiltAdjustAuto:
                 "STAA: Expected 1 screw height but got %d" % (len(self.heights),))
         return self.heights[0]
 
+    def _learn_turns_per_mm(self):
+        # Work out how many turns move the bed 1mm (and which way) from the
+        # last full measurement, where Klipper reports both the height and
+        # the turns for each screw against the base (screw 1). A best fit
+        # across all screws smooths out Klipper's rounding to the minute.
+        base = self.heights[0]
+        pairs = [(base - z, self._measurement_to_turns(m))
+                 for z, m in zip(self.heights[1:], self.measurements)]
+        total = sum(diff * diff for diff, turns in pairs)
+        if total == 0:
+            raise self.gcode.error("STAA: Couldn't work out turns per mm from the measurement")
+        self.turns_per_mm = sum(diff * turns for diff, turns in pairs) / total
+
     def _height_to_turns(self, diff):
-        # How far to turn a screw to raise its corner of the bed by diff mm,
-        # rounded to the minute as SCREWS_TILT_CALCULATE reports it
-        if abs(diff) < 0.001:
+        # How far to turn a screw to raise its corner of the bed by diff mm.
+        # Anything under half a minute is level, as SCREWS_TILT_CALCULATE
+        # would report it as 00:00.
+        turns = diff * self.turns_per_mm
+        if abs(turns) * 60 < 0.5:
             return 0
-        turns = abs(diff) / self.thread_pitch
-        full_turns = math.trunc(turns)
-        turns = full_turns + round((turns - full_turns) * 60, 0) / 60
-        clockwise = (diff > 0) == self.clockwise_thread
-        return turns if clockwise else -turns
+        return turns
 
     def _lookup_screws_tilt_adjust(self):
         sta = self.printer.lookup_object('screws_tilt_adjust', None)

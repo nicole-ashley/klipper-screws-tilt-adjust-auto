@@ -34,9 +34,6 @@ class FakeConfig:
     def get_printer(self):
         return self.printer
 
-    def has_section(self, name):
-        return False
-
 
 class FakeGcmd:
     def __init__(self, params=None):
