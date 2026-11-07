@@ -71,6 +71,11 @@ STATUS_LABELS = {"level": "Levelling", "calibrate": "Calibrating",
                  "test": "Motor test", "manual": "Turning screw"}
 DONE_MESSAGES = {"level": "Bed screws level", "calibrate": "Calibration done",
                  "test": "Motor test passed", "manual": "Screw turned"}
+# The macro OctoApp's Notifications wiki page has Klipper users add. Setting
+# it up is what turns phone notifications on.
+OCTOAPP_NOTIFY_MACRO = "OCTOAPP_NOTIFY_STATUS"
+# print_stats states that mean a print is going
+PRINTING_STATES = ("printing", "paused")
 
 
 class Progress:
@@ -246,6 +251,15 @@ class Progress:
             text = "%+.3fmm, %s" % (screw["deviation"], text)
         return "%s: %s" % (screw["name"], text)
 
+    def result_line(self):
+        # One line on how a run ended, for a phone notification
+        parts = []
+        if self.spread is not None:
+            parts.append(self._spread_line())
+        if self.pass_number:
+            parts.append("%d pass%s" % (self.pass_number, "" if self.pass_number == 1 else "es"))
+        return ", ".join(parts)
+
     def _spread_line(self):
         if self.spread is None:
             return None
@@ -303,6 +317,16 @@ class Progress:
         self.owner._prompt(action)
 
 
+def _notify_text(text):
+    # OctoApp's macro stores the text as a quoted value, splits it at ||| and
+    # ~~~, and Klipper ends a command at ;, so leave those out
+    text = " ".join(str(text).split())
+    for old, new in (('"', ''), ("'", u"\u2019"), ("\\", "/"), (";", ","),
+                     ("|||", "|"), ("~~~", "~")):
+        text = text.replace(old, new)
+    return text
+
+
 class MotorModel:
     """How long to run one motor for a given turn. Turning direction
     changes how fast the motor runs, since one way works against the bed
@@ -355,6 +379,8 @@ class ScrewsTiltAdjustAuto:
         # Klipper's own output for single screw measurements. DEBUG=1 on a
         # command turns it on for that run.
         self.debug_default = config.getboolean("debug", False)
+        # Levelling results sent to OctoApp, when its notify macro is set up
+        self.octoapp_notifications = config.getboolean("octoapp_notifications", True)
         self.debug = self.debug_default
         # Klipper's own respond_raw while its output is held back
         self.held_respond_raw = None
@@ -459,6 +485,7 @@ class ScrewsTiltAdjustAuto:
         self.running = True
         self.cancel_requested = False
         self.motors_moved = False
+        in_print = self._printing()
         self.progress.start(mode, title, text, dialog)
         try:
             yield
@@ -471,13 +498,42 @@ class ScrewsTiltAdjustAuto:
             if cancelled:
                 self.progress.finish("cancelled", home_z=home_z)
             else:
-                self.progress.finish("failed", self._error_text(e))
+                error = self._error_text(e)
+                self.progress.finish("failed", error)
+                if mode == "level":
+                    self._notify("Bed levelling stopped", error)
             raise
         else:
             self.progress.finish("done")
+            if mode == "level" and not in_print:
+                self._notify("Bed screws level", self.progress.result_line())
         finally:
             self.running = False
             self.cancel_requested = False
+
+    def _printing(self):
+        # Whether a print is going, such as a run from a print's start G-code
+        print_stats = self.printer.lookup_object('print_stats', None)
+        if print_stats is None:
+            return False
+        status = print_stats.get_status(self.reactor.monotonic())
+        return status.get("state") in PRINTING_STATES
+
+    def _notify(self, message, detail):
+        # Sends a phone notification through OctoApp, using the macro from
+        # its Notifications wiki page. Without that macro, nothing is sent.
+        if not self.octoapp_notifications:
+            return
+        if self.printer.lookup_object("gcode_macro " + OCTOAPP_NOTIFY_MACRO, None) is None:
+            return
+        script = '%s MESSAGE="%s"' % (OCTOAPP_NOTIFY_MACRO, _notify_text(message))
+        if detail:
+            script += ' DETAIL="%s"' % (_notify_text(detail),)
+        try:
+            self.gcode.run_script_from_command(script)
+        except Exception as e:
+            # A broken notify macro mustn't hide how the run went
+            self._info("Couldn't send the OctoApp notification: " + self._error_text(e))
 
     def _error_text(self, error):
         # Just the message, without "Error on '...': STAA: "
