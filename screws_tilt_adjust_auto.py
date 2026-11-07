@@ -11,6 +11,15 @@ HEATER_REPORT_INTERVAL = 10.
 # The board stops a motor that hasn't been told to keep running for this
 # long, so resend the command more often than that while a motor turns
 MOTOR_KEEPALIVE_INTERVAL = 2.
+# Waits are split into steps this long so a cancel stops a motor promptly
+CANCEL_CHECK_INTERVAL = 0.1
+# Commands that cancel a run. Klipper runs one G-code command at a time, so
+# these are caught as they arrive rather than queueing behind the run.
+CANCEL_COMMANDS = ("SCREWS_TILT_ADJUST_AUTO_CANCEL", "CANCEL_LEVEL_BED_SCREWS")
+# Cancelling a print (Mainsail's and Fluidd's Cancel button, and CANCEL_PRINT
+# from the console) also stops a run, for one started from a print's start
+# G-code. The print cancel itself still runs once the run has stopped.
+PRINT_CANCEL_COMMANDS = ("CANCEL_PRINT",)
 
 # How far each of Klipper's screw_thread options moves per turn, in mm, and
 # whether a clockwise turn raises the bed (matches screws_tilt_adjust.py)
@@ -105,6 +114,11 @@ class ScrewsTiltAdjustAuto:
         self.heights = []
         self.adjustments = []
         self.base = 0
+        # Set while a command that turns motors is running, and when a
+        # cancel has been asked for
+        self.running = False
+        self.cancel_requested = False
+        self.motors_moved = False
 
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -118,12 +132,106 @@ class ScrewsTiltAdjustAuto:
         self.gcode.register_command("SCREWS_TILT_ADJUST_AUTO_CALIBRATE",
                                     self.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE,
                                     desc=self.cmd_SCREWS_TILT_ADJUST_AUTO_CALIBRATE_help)
+        self.gcode.register_command("SCREWS_TILT_ADJUST_AUTO_CANCEL",
+                                    self.cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL,
+                                    desc=self.cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL_help)
+        self._catch_cancel_commands()
+
+    def _catch_cancel_commands(self):
+        # A run holds Klipper's G-code lock until it finishes, so a cancel
+        # sent from Mainsail, Fluidd, KlipperScreen or the console would
+        # wait behind it and arrive too late. Each request from Moonraker is
+        # handled on its own, so catch cancels here, before they wait for the
+        # lock. Everything else goes through untouched.
+        run_script = getattr(self.gcode, "run_script", None)
+        if run_script is None:
+            return
+        def run_script_or_cancel(script):
+            if self.running:
+                command = self._single_command(script)
+                if command in CANCEL_COMMANDS:
+                    self._request_cancel()
+                    return
+                if command in PRINT_CANCEL_COMMANDS:
+                    self._request_cancel()
+            return run_script(script)
+        self.gcode.run_script = run_script_or_cancel
+
+    def _single_command(self, script):
+        # The command, in capitals, if the script is just one command with no
+        # parameters, otherwise None
+        words = script.split()
+        return words[0].upper() if len(words) == 1 else None
+
+    def _request_cancel(self):
+        if not self.cancel_requested:
+            self.cancel_requested = True
+            self.gcode.respond_info("STAA: Cancelling")
+
+    def _check_cancelled(self):
+        if self.cancel_requested:
+            raise self.gcode.error("STAA: Cancelled")
+
+    @contextlib.contextmanager
+    def _run(self, gcmd=None):
+        # Marks a command that turns motors as running, so it can be
+        # cancelled, and shows the cancel dialog when asked to
+        if self.running:
+            raise self.gcode.error("STAA: Already running")
+        dialog = gcmd is not None and bool(gcmd.get_int("DIALOG", 0, minval=0, maxval=1))
+        self.running = True
+        self.cancel_requested = False
+        self.motors_moved = False
+        if dialog:
+            self._show_cancel_dialog()
+        try:
+            yield
+        except self.gcode.error:
+            if self.cancel_requested and self.motors_moved:
+                self.gcode.respond_info(
+                    "STAA: Screws were turned before cancelling, so home Z (G28 Z)"
+                    " before printing")
+            raise
+        finally:
+            self.running = False
+            self.cancel_requested = False
+            if dialog:
+                self._prompt("prompt_end")
+
+    def _show_cancel_dialog(self):
+        self._prompt("prompt_begin Levelling bed screws")
+        self._prompt("prompt_text Turning the bed screws until the bed is level."
+                     " Cancel stops the motors straight away. A probe move that's"
+                     " already started finishes first.")
+        self._prompt("prompt_footer_button Cancel|SCREWS_TILT_ADJUST_AUTO_CANCEL|error")
+        self._prompt("prompt_show")
+
+    def _prompt(self, action):
+        # Same output as RESPOND TYPE=command, which Mainsail, Fluidd and
+        # KlipperScreen show as a dialog
+        self.gcode.respond_raw("// action:" + action)
+
+    cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL_help = "Cancel a running bed screw adjustment"
+    def cmd_SCREWS_TILT_ADJUST_AUTO_CANCEL(self, gcmd):
+        # Usually only reached when nothing is running, since a cancel sent
+        # during a run is caught on its way in
+        if self.running:
+            self._request_cancel()
+        else:
+            self.gcode.respond_info("STAA: Nothing to cancel")
 
     def _pause(self, seconds):
         # Let Klipper keep running (heater control in particular) while we
         # wait. A blocking sleep here stalls the host, and if heaters are on
-        # for more than a few seconds Klipper shuts the printer down.
-        self.reactor.pause(self.reactor.monotonic() + seconds)
+        # for more than a few seconds Klipper shuts the printer down. Waits
+        # are split up so a cancel is noticed quickly.
+        end = self.reactor.monotonic() + seconds
+        while True:
+            self._check_cancelled()
+            now = self.reactor.monotonic()
+            if now >= end:
+                return
+            self.reactor.pause(min(end, now + CANCEL_CHECK_INTERVAL))
 
     def _connect_to_board(self):
         self.board = serial.Serial(
@@ -172,13 +280,14 @@ class ScrewsTiltAdjustAuto:
             self._check_move_size(directions, "Add FORCE=1 to turn it anyway.")
 
         self._load_motor_state()
-        self._connect_to_board()
-        try:
-            self.gcode.respond_info("STAA: " + ",".join(map(str, directions)))
-            self._turn_motors(directions)
-        finally:
-            self._disconnect_from_board()
-            self._save_motor_state()
+        with self._run(gcmd):
+            self._connect_to_board()
+            try:
+                self.gcode.respond_info("STAA: " + ",".join(map(str, directions)))
+                self._turn_motors(directions)
+            finally:
+                self._disconnect_from_board()
+                self._save_motor_state()
 
     cmd_SCREWS_TILT_ADJUST_AUTO_help = "Tool to automatically adjust bed level screws"
     def cmd_SCREWS_TILT_ADJUST_AUTO(self, gcmd):
@@ -194,7 +303,8 @@ class ScrewsTiltAdjustAuto:
         self.run_turns = {}
         self._load_motor_state()
         try:
-            self._adjust(gcmd)
+            with self._run(gcmd):
+                self._adjust(gcmd)
         finally:
             self.run_turns = None
             self._save_motor_state()
@@ -323,6 +433,7 @@ class ScrewsTiltAdjustAuto:
             "METHOD": "scan", "SAMPLE_TIME": str(self.scan_sample_time)})
         session = probe.start_probe_session(gcmd)
         def scan():
+            self._check_cancelled()
             session.run_probe(gcmd)
             return self._probe_result_z(session.pull_probed_results()[-1])
         try:
@@ -470,6 +581,7 @@ class ScrewsTiltAdjustAuto:
     def _run_screws_tilt_calculate(self):
         # Returns (height, turns, is_base) for each screw measured, in
         # Klipper's screw order. Turns are positive for clockwise.
+        self._check_cancelled()
         sta = self._lookup_screws_tilt_adjust()
         self.gcode.run_script_from_command(
             "SCREWS_TILT_CALCULATE MAX_DEVIATION=%s" % (self.max_deviation,))
@@ -669,10 +781,14 @@ class ScrewsTiltAdjustAuto:
     def _run_motor(self, screw, direction, seconds):
         # Run one motor for the given time. The next command to the board
         # stops it, so callers stop the motors when they're done.
+        self._check_cancelled()
         motor = (screw + 1) * direction
         self.gcode.respond_info("STAA: %d for %.3f seconds." % (motor, seconds))
         command = str(motor).encode()
         self.board.write(command)
+        self.motors_moved = True
+        # Set now, since even a turn cut short by a cancel takes up the slack
+        self._motor(screw).last_direction = direction
         wait_time = seconds
         while wait_time > MOTOR_KEEPALIVE_INTERVAL:
             self._pause(MOTOR_KEEPALIVE_INTERVAL)
@@ -680,7 +796,6 @@ class ScrewsTiltAdjustAuto:
             # Tells the board to keep this motor running
             self.board.write(command)
         self._pause(wait_time)
-        self._motor(screw).last_direction = direction
 
     def _stop_motors(self):
         self.gcode.respond_info("STAA: Stopping motors.")
@@ -779,17 +894,18 @@ class ScrewsTiltAdjustAuto:
         self._check_move_size([turns * 2], "Use a smaller TURNS.")
         self._load_motor_state()
         try:
-            if level_first:
-                # Calibrate where the screws normally sit, since the motors
-                # run slower the tighter a screw is. Motors that are far off
-                # might not quite get there before they're calibrated, which
-                # is close enough.
-                self.run_turns = {}
-                if not self._auto_adjust():
-                    self.gcode.respond_info(
-                        "STAA: Couldn't fully level first, calibrating from here")
-                self.run_turns = None
-            results = self._calibrate(gcmd, screw, turns, cycles)
+            with self._run(gcmd):
+                if level_first:
+                    # Calibrate where the screws normally sit, since the motors
+                    # run slower the tighter a screw is. Motors that are far off
+                    # might not quite get there before they're calibrated, which
+                    # is close enough.
+                    self.run_turns = {}
+                    if not self._auto_adjust():
+                        self.gcode.respond_info(
+                            "STAA: Couldn't fully level first, calibrating from here")
+                    self.run_turns = None
+                results = self._calibrate(gcmd, screw, turns, cycles)
         finally:
             self.run_turns = None
             self._save_motor_state()
