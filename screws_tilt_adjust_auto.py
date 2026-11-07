@@ -3,11 +3,15 @@
 # Copyright (C) 2024  Nicole Ashley <nicole@ashley.kiwi>
 #
 # This file may be distributed under the terms of the MIT license.
+import math
 import re
 import serial
 
 HANDSHAKE_TIMEOUT = 30.
 HEATER_REPORT_INTERVAL = 10.
+
+# Bed movement in mm per full turn, as Klipper's screws_tilt_adjust uses
+THREAD_PITCHES = {"M3": 0.5, "M4": 0.7, "M5": 0.8, "M6": 1.0}
 
 class ScrewsTiltAdjustAuto:
     def __init__(self, config):
@@ -19,6 +23,8 @@ class ScrewsTiltAdjustAuto:
         self.maximum_attempts = config.getint("maximum_attempts", 10)
         self.board = None
         self.one_by_one = False
+        self.heights = []
+        self._read_screw_thread(config)
 
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -31,8 +37,21 @@ class ScrewsTiltAdjustAuto:
                                     desc=self.cmd_SCREWS_TILT_ADJUST_MANUAL_help)
         self.gcode.register_output_handler(self._handle_output)
 
+    def _read_screw_thread(self, config):
+        # Read the thread from [screws_tilt_adjust] so one by one mode can
+        # turn a single screw's height into turns, the same way Klipper does
+        thread = "CW-M3"
+        if config.has_section("screws_tilt_adjust"):
+            thread = config.getsection("screws_tilt_adjust").get("screw_thread", thread)
+        direction, size = thread.upper().split("-")
+        self.thread_pitch = THREAD_PITCHES.get(size, 0.5)
+        self.clockwise_thread = direction == "CW"
+
     def _handle_output(self, output):
         if self.active:
+            match = re.search(r": x=[-\d.]+, y=[-\d.]+, z=(-?[\d.]+)", output)
+            if match is not None:
+                self.heights.append(float(match.group(1)))
             match = re.search(r":[^:]+: adjust (C?CW) (\d+):(\d+)", output)
             if match is not None:
                 self.measurements.append({
@@ -136,19 +155,20 @@ class ScrewsTiltAdjustAuto:
         return level
 
     def _adjust_one_by_one(self, movements):
-        # Settle each screw in turn against a reference screw that doesn't
-        # need moving, measuring only those two screws between turns. The
-        # caller does a full measurement again afterwards, since moving one
-        # screw can slightly change the others. Returns False if a screw
-        # couldn't be settled within maximum_attempts.
-        reference = movements.index(0)
+        # Settle each screw in turn, probing only that screw between turns
+        # and comparing it to the height the full measurement says it should
+        # be at (that of a screw that doesn't need moving). The caller does a
+        # full measurement again afterwards, since moving one screw can
+        # slightly change the others. Returns False if a screw couldn't be
+        # settled within maximum_attempts.
+        target = self.heights[movements.index(0)]
         for screw, movement in enumerate(movements):
             if movement == 0:
                 continue
             for attempt in range(self.maximum_attempts):
                 self.gcode.respond_info("STAA: Screw %d movement: %s" % (screw + 1, movement))
                 self._turn_motors(self._single_motor(screw, movement, len(movements)))
-                movement = self._measure_screw(reference, screw)
+                movement = self._height_to_turns(target - self._measure_screw(screw))
                 if movement == 0:
                     break
             else:
@@ -255,22 +275,23 @@ class ScrewsTiltAdjustAuto:
     def _run_screws_tilt_calculate(self):
         self.active = True
         self.measurements = []
+        self.heights = []
         try:
             self.gcode.run_script_from_command("SCREWS_TILT_CALCULATE MAX_DEVIATION=10")
         finally:
             self.active = False
 
-    def _measure_screw(self, reference, screw):
+    def _measure_screw(self, screw):
         # Klipper's screws_tilt_adjust probes every screw it's configured
-        # with, so narrow it to just the reference and this screw while we
-        # measure. The reference goes first so it's used as the base.
+        # with, so narrow it to just this screw while we measure. Using the
+        # same probing as the full measurement keeps the heights comparable.
         sta = self._lookup_screws_tilt_adjust()
         screws = sta.screws
         probe_points = sta.probe_helper.probe_points
         results = getattr(sta, "results", None)
         self.gcode.respond_info("STAA: Measuring screw %d" % (screw + 1,))
         try:
-            sta.screws = [screws[reference], screws[screw]]
+            sta.screws = [screws[screw]]
             sta.probe_helper.probe_points = [coord for coord, name in sta.screws]
             self._run_screws_tilt_calculate()
         finally:
@@ -278,10 +299,21 @@ class ScrewsTiltAdjustAuto:
             sta.probe_helper.probe_points = probe_points
             if results is not None:
                 sta.results = results
-        if len(self.measurements) != 1:
+        if len(self.heights) != 1:
             raise self.gcode.error(
-                "STAA: Expected 1 screw measurement but got %d" % (len(self.measurements),))
-        return self._measurement_to_turns(self.measurements[0])
+                "STAA: Expected 1 screw height but got %d" % (len(self.heights),))
+        return self.heights[0]
+
+    def _height_to_turns(self, diff):
+        # How far to turn a screw to raise its corner of the bed by diff mm,
+        # rounded to the minute as SCREWS_TILT_CALCULATE reports it
+        if abs(diff) < 0.001:
+            return 0
+        turns = abs(diff) / self.thread_pitch
+        full_turns = math.trunc(turns)
+        turns = full_turns + round((turns - full_turns) * 60, 0) / 60
+        clockwise = (diff > 0) == self.clockwise_thread
+        return turns if clockwise else -turns
 
     def _lookup_screws_tilt_adjust(self):
         sta = self.printer.lookup_object('screws_tilt_adjust', None)

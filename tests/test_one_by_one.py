@@ -34,6 +34,12 @@ class FakeConfig:
     def get_printer(self):
         return self.printer
 
+    def has_section(self, name):
+        return name in self.values.get("sections", {})
+
+    def getsection(self, name):
+        return FakeConfig(self.printer, self.values["sections"][name])
+
 
 class FakeGcmd:
     def __init__(self, params=None):
@@ -225,11 +231,11 @@ class OneByOneTest(unittest.TestCase):
         # then a full pass to confirm
         self.assertEqual(probes[0], "probed 1,2,3,4")
         self.assertEqual(probes[-1], "probed 1,2,3,4")
-        singles = [p for p in probes[1:-1]]
-        self.assertTrue(all(p in ("probed 1,2", "probed 1,3", "probed 1,4") for p in singles))
-        self.assertEqual(sorted(singles, key=lambda p: p[-1]), singles)
+        singles = probes[1:-1]
+        self.assertEqual(sorted(set(singles)), ["probed 2", "probed 3", "probed 4"])
+        self.assertEqual(sorted(singles), singles)
         # Motors that don't turn their full amount need more than one go
-        self.assertGreater(singles.count("probed 1,2"), 1)
+        self.assertGreater(singles.count("probed 2"), 1)
         self.assertIn("G28 Z", gcode.scripts)
 
     def test_klipper_screw_list_is_restored(self):
@@ -249,8 +255,8 @@ class OneByOneTest(unittest.TestCase):
         self.assertTrue(is_level(bed))
         self.assertEqual(bed.turns[2], 0.)
         probes = [s for s in gcode.scripts if s.startswith("probed")]
-        self.assertIn("probed 3,1", probes)
-        self.assertNotIn("probed 1,3", probes)
+        self.assertIn("probed 1", probes)
+        self.assertNotIn("probed 3", probes)
 
     def test_already_level_does_nothing(self):
         obj, bed, gcode, sta = make([0., 0., 0.])
@@ -289,6 +295,30 @@ class FakeHeaters:
         return FakeHeater()
 
 
+class ThreadTest(unittest.TestCase):
+    def make_with_thread(self, thread):
+        obj, bed, gcode, sta = make([0., 0., 0.])
+        obj._read_screw_thread(FakeConfig(None, {
+            "sections": {"screws_tilt_adjust": {"screw_thread": thread}}}))
+        return obj
+
+    def test_defaults_to_cw_m3(self):
+        obj, bed, gcode, sta = make([0., 0., 0.])
+        self.assertEqual(obj._height_to_turns(0.25), 0.5)
+        self.assertEqual(obj._height_to_turns(-0.25), -0.5)
+
+    def test_reads_thread_from_screws_tilt_adjust(self):
+        obj = self.make_with_thread("CCW-M4")
+        self.assertAlmostEqual(obj._height_to_turns(0.35), -0.5)
+        self.assertAlmostEqual(obj._height_to_turns(-0.7), 1.)
+
+    def test_rounds_to_the_minute_like_klipper(self):
+        obj = self.make_with_thread("CW-M3")
+        self.assertEqual(obj._height_to_turns(0.0005), 0)
+        self.assertEqual(obj._height_to_turns(0.004), 0)
+        self.assertAlmostEqual(obj._height_to_turns(0.1), 12 / 60.)
+
+
 class OneByOneWithHeatersTest(unittest.TestCase):
     def test_combines_with_wait_for_heaters(self):
         obj, bed, gcode, sta = make([0., 0.2, -0.1], efficiency=0.7)
@@ -296,7 +326,7 @@ class OneByOneWithHeatersTest(unittest.TestCase):
         obj.cmd_SCREWS_TILT_ADJUST_AUTO(FakeGcmd({"ONE_BY_ONE": 1, "WAIT_FOR_HEATERS": 1}))
         self.assertTrue(is_level(bed))
         probes = [s for s in gcode.scripts if s.startswith("probed")]
-        self.assertIn("probed 1,2", probes)
+        self.assertIn("probed 2", probes)
 
 
 class DefaultModeTest(unittest.TestCase):
