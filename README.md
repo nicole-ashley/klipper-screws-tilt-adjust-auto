@@ -124,6 +124,18 @@ While a run is going, Mainsail, Fluidd and KlipperScreen can show where it's up 
   | `run_turns` | how far each screw has turned this run |
   | `error` | why the last run failed |
 
+### Phone notifications (OctoApp)
+OctoApp may not show the dialog, but it can send phone notifications from macros. To get one when levelling ends, add the `_OCTOAPP_STATUS` and `OCTOAPP_NOTIFY_STATUS` macros from [OctoApp's Notifications page](https://github.com/crysxd/OctoApp-Plugin/wiki/Notifications) to `printer.cfg`. The extra finds `OCTOAPP_NOTIFY_STATUS` and sends:
+
+- **"Bed screws level"** with the final spread and the number of passes, when `SCREWS_TILT_ADJUST_AUTO` (or **Level** in the dialog) finishes. This isn't sent when it runs during a print, such as from a print's start G-code, since the print carrying on shows it worked.
+- **"Bed levelling stopped"** with the reason, when a levelling run fails, during a print or not.
+
+Cancelling doesn't send anything, and nor do the motor test, calibration or `SCREWS_TILT_ADJUST_MANUAL`. Without the OctoApp macros nothing is sent. To stop the notifications but keep the macros, add this to the `[screws_tilt_adjust_auto]` section:
+```ini
+octoapp_notifications: False
+```
+OctoApp sends at most 25 of these notifications per print. Outside of prints, the count builds up until the next print starts.
+
 ### Safety limits
 So that a bad reading or a motor wired the wrong way can't wind a screw out of the bed, every run stops with an error, and leaves the motors stopped, if:
 - any single turn would be bigger than `max_turns_per_move`. Nothing moves if the first measurement asks for too much, so a badly out of level bed needs levelling by hand (or with `SCREWS_TILT_ADJUST_MANUAL`) first, or a higher limit.
