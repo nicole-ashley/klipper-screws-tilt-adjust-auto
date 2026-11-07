@@ -52,7 +52,7 @@ managed_services: klipper
   3. Go back to step 1, until a full measurement shows the bed is level.
 
   Readings use Klipper's own `METHOD=scan` probing, so drift compensation and the probe's calibrated range all apply. Only how the reading changes is used, so it doesn't matter if it's slightly offset from the full measurement. It needs a `[probe_eddy_current]` probe and a Klipper version from mid 2024 or later. It can be combined with `WAIT_FOR_HEATERS=1`.
-- `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns>` turns one screw motor by the given number of turns (negative for counter-clockwise).
+- `SCREWS_TILT_ADJUST_MANUAL SCREW=<n> DISTANCE=<turns> [FORCE=1]` turns one screw motor by the given number of turns (negative for counter-clockwise). Turns bigger than `max_turns_per_move` are refused unless you add `FORCE=1`.
 
 Optional settings for continuous mode, in the `[screws_tilt_adjust_auto]` section:
 ```ini
@@ -61,6 +61,23 @@ scan_sample_time: 0.5   # seconds of readings averaged for each check
 ```
 
 Set your heater targets first (for example with `M140 S60` and `M104 S200`), then run the command.
+
+### Safety limits
+So that a bad reading or a motor wired the wrong way can't wind a screw out of the bed, every run stops with an error, and leaves the motors stopped, if:
+- any single turn would be bigger than `max_turns_per_move`. Nothing moves if the first measurement asks for too much, so a badly out of level bed needs levelling by hand (or with `SCREWS_TILT_ADJUST_MANUAL`) first, or a higher limit.
+- any screw would turn more than `max_turns_per_run` in total during one `SCREWS_TILT_ADJUST_AUTO`, counting every pass and both directions.
+- the bed gets further from level after the screws are turned. In `ONE_BY_ONE` and `CONTINUOUS` modes this is checked after every turn of every screw, which also catches a screw that barely moves two turns in a row (a slipping coupler or a stalled motor).
+- the measurement doesn't fit a real screw thread, or (on Klipper versions that expose it) doesn't match the `screw_thread` in `[screws_tilt_adjust]`.
+- any screw is more than `max_deviation` mm off, using Klipper's own `MAX_DEVIATION` check.
+
+The board also stops any motor that Klipper hasn't told to keep running in the last 5 seconds, so a crash or a dropped USB connection mid-turn can't leave a motor running. This needs the latest `screws-tilt-adjust-auto.ino` uploaded to the board; older firmware still works but doesn't have this protection.
+
+```ini
+max_turns_per_move: 1      # biggest single turn, in turns
+max_turns_per_run: 3       # most any screw may turn in one run, in turns
+max_deviation: 2           # mm, passed to SCREWS_TILT_CALCULATE
+reading_tolerance: 0.02    # mm of probe noise allowed before a reading counts as getting worse
+```
 
 ## Running the tests
 ```sh
