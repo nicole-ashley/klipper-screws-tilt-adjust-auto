@@ -323,7 +323,8 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(registered, ["SCREWS_TILT_ADJUST_AUTO", "SCREWS_TILT_ADJUST_MANUAL",
                                       "SCREWS_TILT_ADJUST_AUTO_CALIBRATE",
                                       "SCREWS_TILT_ADJUST_AUTO_CANCEL",
-                                      "SCREWS_TILT_ADJUST_AUTO_TEST"])
+                                      "SCREWS_TILT_ADJUST_AUTO_TEST",
+                                      "_SCREWS_TILT_ADJUST_AUTO_CLOSE_DIALOG"])
 
 
 if __name__ == "__main__":
