@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Links the Screws Tilt Adjust Auto extra into Klipper.
+# Links the Screws Tilt Adjust Auto extra into Klipper and adds it to
+# Moonraker's update manager.
 #
 # Usage:
-#   ./install.sh               install, then restart Klipper
-#   ./install.sh --uninstall   remove the link, then restart Klipper
+#   ./install.sh               install, then restart Klipper (and Moonraker
+#                              if its config changed)
+#   ./install.sh --uninstall   undo all of that
 #
 # Set KLIPPER_PATH if Klipper isn't in ~/klipper, and KLIPPER_CONFIG_PATH if
-# printer.cfg isn't in ~/printer_data/config.
+# printer.cfg isn't in ~/printer_data/config. moonraker.conf is expected next
+# to printer.cfg; set MOONRAKER_CONFIG if it's somewhere else.
 set -euo pipefail
 
 MODULE="screws_tilt_adjust_auto.py"
@@ -19,6 +22,7 @@ EXCLUDE_ENTRY="klippy/extras/$MODULE"
 MACROS="screws_tilt_adjust_auto.cfg"
 CONFIG_PATH="${KLIPPER_CONFIG_PATH:-$HOME/printer_data/config}"
 MACROS_LINK="$CONFIG_PATH/$MACROS"
+MOONRAKER_CONFIG="${MOONRAKER_CONFIG:-$CONFIG_PATH/moonraker.conf}"
 
 if [ "$(id -u)" -eq 0 ]; then
     echo "Run this as the user Klipper runs as, not as root." >&2
@@ -31,14 +35,43 @@ if [ ! -d "$EXTRAS_DIR" ]; then
     exit 1
 fi
 
-restart_klipper() {
+restart_service() {
     if command -v systemctl >/dev/null 2>&1 \
-        && systemctl list-unit-files klipper.service >/dev/null 2>&1; then
-        echo "Restarting Klipper..."
-        sudo systemctl restart klipper
+        && systemctl list-unit-files "$1.service" >/dev/null 2>&1; then
+        echo "Restarting $2..."
+        sudo systemctl restart "$1"
     else
-        echo "Restart Klipper to apply the change."
+        echo "Restart $2 to apply the change."
     fi
+}
+
+restart_klipper() {
+    restart_service klipper Klipper
+}
+
+# Adds, fixes or removes the [update_manager] section in moonraker.conf, and
+# restarts Moonraker if anything changed.
+update_moonraker() {
+    if [ ! -f "$MOONRAKER_CONFIG" ]; then
+        if [ "$1" = install ]; then
+            echo "Couldn't find moonraker.conf at $MOONRAKER_CONFIG, so automatic updates weren't set up." >&2
+            echo "Set MOONRAKER_CONFIG to its path and run this again, or add the section from the README by hand." >&2
+        fi
+        return
+    fi
+    local result
+    if ! result="$(python3 "$SRC_DIR/moonraker_update_manager.py" "$1" "$MOONRAKER_CONFIG" "$SRC_DIR")"; then
+        echo "Couldn't update $MOONRAKER_CONFIG. Add or remove the section from the README by hand." >&2
+        return
+    fi
+    case "$result" in
+        added) echo "Added the update manager section to $MOONRAKER_CONFIG" ;;
+        updated) echo "Updated the update manager section in $MOONRAKER_CONFIG" ;;
+        removed) echo "Removed the update manager section from $MOONRAKER_CONFIG" ;;
+    esac
+    case "$result" in
+        added|updated|removed) restart_service moonraker Moonraker ;;
+    esac
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
@@ -55,6 +88,7 @@ if [ "${1:-}" = "--uninstall" ]; then
         rm "$MACROS_LINK"
         echo "Removed $MACROS_LINK. Remove [include $MACROS] from printer.cfg too."
     fi
+    update_moonraker uninstall
     restart_klipper
     exit 0
 fi
@@ -87,4 +121,5 @@ if [ -d "$KLIPPER_PATH/.git" ]; then
     grep -qxF "$EXCLUDE_ENTRY" "$EXCLUDE_FILE" || echo "$EXCLUDE_ENTRY" >> "$EXCLUDE_FILE"
 fi
 
+update_moonraker install
 restart_klipper
