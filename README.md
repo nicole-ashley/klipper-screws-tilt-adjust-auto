@@ -14,7 +14,7 @@ On your Klipper computer's terminal, run these commands as the user Klipper runs
 git clone https://github.com/nicole-ashley/klipper-screws-tilt-adjust-auto ~/screws-tilt-adjust-auto
 ~/screws-tilt-adjust-auto/install.sh
 ```
-The install script links the extra into `~/klipper/klippy/extras` and its macros file into `~/printer_data/config`, tells Klipper's git checkout to ignore the extra's link so Klipper updates aren't affected, and restarts Klipper. If Klipper isn't in `~/klipper`, set `KLIPPER_PATH` first, for example `KLIPPER_PATH=~/my-klipper ~/screws-tilt-adjust-auto/install.sh`. If `printer.cfg` isn't in `~/printer_data/config`, set `KLIPPER_CONFIG_PATH` the same way. You only need to run it once: updates to this repo are picked up through the link. To remove it, run `~/screws-tilt-adjust-auto/install.sh --uninstall`.
+The install script links the extra into `~/klipper/klippy/extras` and its macros file into `~/printer_data/config`, tells Klipper's git checkout to ignore the extra's link so Klipper updates aren't affected, sets up [automatic updates](#automatic-updates) in Moonraker, and restarts Klipper. If Klipper isn't in `~/klipper`, set `KLIPPER_PATH` first, for example `KLIPPER_PATH=~/my-klipper ~/screws-tilt-adjust-auto/install.sh`. If `printer.cfg` isn't in `~/printer_data/config`, set `KLIPPER_CONFIG_PATH` the same way, and if `moonraker.conf` isn't next to it, set `MOONRAKER_CONFIG` to its path. You only need to run it once: updates to this repo are picked up through the link. To remove it, run `~/screws-tilt-adjust-auto/install.sh --uninstall`.
 
 Then add a section for your dev board to `printer.cfg`, alongside your existing `[screws_tilt_adjust]` section:
 ```ini
@@ -29,7 +29,8 @@ To get a "Level bed screws" button in Mainsail, Fluidd and KlipperScreen, also a
 ```
 The button needs a `[respond]` section, which most configs already have. If yours doesn't, add an empty `[respond]` line too. Don't edit the included file, as updates replace it. To customise it, copy it under another name and include that instead.
 
-And for automatic updates, add this section to your `moonraker.conf`:
+### Automatic updates
+The install script adds this section to your `moonraker.conf` and restarts Moonraker, so Mainsail, Fluidd and KlipperScreen offer updates to the extra alongside Klipper's:
 ```ini
 [update_manager screws-tilt-adjust-auto]
 type: git_repo
@@ -38,6 +39,7 @@ origin: https://github.com/nicole-ashley/klipper-screws-tilt-adjust-auto
 primary_branch: main
 managed_services: klipper
 ```
+If you added this section by hand before, under this name or an older one, the script fixes it in place rather than adding a second one. Running it again changes nothing, and `--uninstall` removes the section. `path` is wherever you cloned the repo.
 
 ## Usage
 - `LEVEL_BED_SCREWS` opens a dialog in Mainsail, Fluidd and KlipperScreen, and is listed with your other macros. It shows which heaters are on, then offers:
